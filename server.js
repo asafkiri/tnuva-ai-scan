@@ -30,7 +30,7 @@ const OPENAI_MAX_OUTPUT_TOKENS = 48_000;
 const OPENAI_TIMEOUT_MS = 180_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 2; // v2: פעימות-חיים בתשובת הסריקה — ספארי iOS מנתק המתנה ללא בייט ראשון
+const SERVICE_VERSION = 3; // v2: פעימות-חיים בתשובת הסריקה — ספארי iOS מנתק המתנה ללא בייט ראשון
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -206,6 +206,21 @@ export function scanChecksumMismatches(scan, inputDocuments) {
     }
     const moneyOff = Math.abs(net - expected) > CHECKSUM_TOLERANCE_EX_VAT + 1e-9;
     const linesOff = Number.isFinite(input.expectedLines) && itemsLines !== input.expectedLines;
+    // v3: בלוק הסיכום חתוך. אם השורות סוכמו יפה אבל בדיוק ההפרש מול העוגן
+    // הוא סכום שלא הוסבר, והמסמך לא החזיר לא "סד הנחה" ולא "סהכ חייב מעמ" —
+    // זה צילום שנקטע לפני בלוק הסיכום, לא קריאה שגויה. קריאות חוזרות במאמץ
+    // גבוה לא יצילו אותו (הוכח בשטח 7.8: התעודה בלי התחתית עלתה כסף ונתקעה).
+    // מסמנים את המקרה כדי לוותר מיד עם הסבר מדויק, בלי סבב יקר.
+    // הסימן המבחין בין "צילום קטוע" ל"קריאה שגויה": בלוק הסיכום מכיל גם את
+    // אחוז המע"מ, את הסהכ ואת שורת המע"מ. אם אף אחד מהם לא נקרא — הבלוק לא
+    // היה בתמונה. קריאה שגויה של תעודה שלמה כן מחזירה לפחות אחד מהם.
+    const summaryBlockMissing = moneyOff
+      && !linesOff
+      && !Number.isFinite(doc.promoDiscountExVat)
+      && !Number.isFinite(doc.subtotalExVat)
+      && !Number.isFinite(doc.vatAmount)
+      && !Number.isFinite(doc.totalInclVat)
+      && !Number.isFinite(doc.vatPct);
     if (moneyOff || linesOff) {
       out.push({
         noteIndex: doc.noteIndex,
@@ -213,6 +228,7 @@ export function scanChecksumMismatches(scan, inputDocuments) {
         expected,
         gotLines: itemsLines,
         expectedLines: Number.isFinite(input.expectedLines) ? input.expectedLines : null,
+        summaryBlockMissing,
       });
     }
   }
@@ -752,6 +768,16 @@ export function createServer({
 
       let checksumRetryAttempted = false;
       const firstMismatches = scanChecksumMismatches(scan, documents);
+      // v3: צילום שנקטע לפני בלוק הסיכום — ויתור מיידי עם הסבר, בלי סבב יקר.
+      const cutOff = firstMismatches.filter(item => item.summaryBlockMissing);
+      if (cutOff.length && cutOff.length === firstMismatches.length) {
+        for (const item of cutOff) {
+          const warning = `בתעודה ${item.noteIndex + 1} לא נקרא בלוק הסיכום שבתחתית הנייר (סד הנחה בגין מבצעים / סהכ חייב מעמ). השורות הסתכמו ל-₪${item.got.toFixed(2)} מול עוגן ₪${item.expected.toFixed(2)} — צלם שוב את התעודה כולה, עד השורה האחרונה, כולל הסיכום.`;
+          if (!scan.warnings.includes(warning)) scan.warnings.push(warning);
+        }
+        finishScan({ ok: false, serviceVersion: SERVICE_VERSION, error: "summary_block_missing", warnings: scan.warnings });
+        return;
+      }
       if (firstMismatches.length) {
         checksumRetryAttempted = true;
         const second = await attemptScan(checksumCorrectiveText(firstMismatches), CHECKSUM_RETRY_REASONING_EFFORT);
