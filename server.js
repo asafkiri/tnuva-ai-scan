@@ -30,7 +30,7 @@ const OPENAI_MAX_OUTPUT_TOKENS = 48_000;
 const OPENAI_TIMEOUT_MS = 180_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 1;
+const SERVICE_VERSION = 2; // v2: פעימות-חיים בתשובת הסריקה — ספארי iOS מנתק המתנה ללא בייט ראשון
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -501,6 +501,7 @@ export function createServer({
   return http.createServer(async (request, response) => {
     const origin = typeof request.headers.origin === "string" ? request.headers.origin : "";
     const url = new URL(request.url || "/", "http://localhost");
+    let scanHeartbeat = null; // v2: מוצהר כאן כדי שגם ה-catch החיצוני ינקה אותו
 
     try {
       if (request.method === "OPTIONS") {
@@ -625,6 +626,24 @@ export function createServer({
         return;
       }
 
+      // ===== v2: פעימות-חיים =====
+      // הוכח בשטח (7.8): הבקשה מגיעה, המודל קורא ומשלם — אבל ספארי ב-iOS
+      // הורג המתנה שלא קיבלה בייט ראשון תוך ~דקה, והתשובה מתה על קו סגור.
+      // הפתרון: כותרות 200 נשלחות מיד, ורווח יוצא כל 10 שניות עד שהתשובה
+      // מוכנה. רווחים לבנים הם קידומת JSON חוקית — הלקוח מנתח כרגיל.
+      // מרגע זה גם שגיאות חוזרות כגוף JSON עם ok:false בסטטוס 200; הלקוח
+      // ממילא מנתב לפי payload.ok וקוד השגיאה, לא לפי הסטטוס.
+      response.writeHead(200, Object.assign({
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+      }, corsHeaders(origin)));
+      scanHeartbeat = setInterval(() => { try { response.write(" "); } catch (error) {} }, 10_000);
+      const finishScan = (value) => {
+        clearInterval(scanHeartbeat);
+        scanHeartbeat = null;
+        try { response.end(JSON.stringify(value)); } catch (error) {}
+      };
+
       // אין קטלוג ואין רמזים: הקוד המודפס הוא הזהות, וההתאמה נעשית בלקוח.
       const content = [{
         type: "input_text",
@@ -726,7 +745,7 @@ export function createServer({
 
       let attempt = await attemptScan(null, OPENAI_REASONING_EFFORT);
       if (attempt.fail) {
-        writeJson(response, origin, attempt.fail.status, attempt.fail.body);
+        finishScan(attempt.fail.body);
         return;
       }
       let { scan, data, openaiResponse } = attempt;
@@ -750,7 +769,7 @@ export function createServer({
         }
       }
 
-      writeJson(response, origin, 200, {
+      finishScan({
         ok: true,
         serviceVersion: SERVICE_VERSION,
         scan,
@@ -761,10 +780,11 @@ export function createServer({
       });
     } catch (error) {
       logger.error("Unhandled scanner error", error);
+      if (scanHeartbeat) clearInterval(scanHeartbeat);
       if (!response.headersSent) {
         writeJson(response, origin, 500, { ok: false, error: "internal_error" });
       } else {
-        response.end();
+        try { response.end(JSON.stringify({ ok: false, error: "internal_error" })); } catch (e) {}
       }
     }
   });
