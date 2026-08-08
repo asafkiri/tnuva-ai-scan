@@ -47,7 +47,7 @@ const OPENAI_MAX_OUTPUT_TOKENS = 48_000;
 const OPENAI_TIMEOUT_MS = 180_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 5; // v2: פעימות-חיים בתשובת הסריקה — ספארי iOS מנתק המתנה ללא בייט ראשון
+const SERVICE_VERSION = 6; // v2: פעימות-חיים בתשובת הסריקה — ספארי iOS מנתק המתנה ללא בייט ראשון
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -286,6 +286,17 @@ export function scanChecksumMismatches(scan, inputDocuments) {
     }
     const moneyOff = Math.abs(net - expected) > CHECKSUM_TOLERANCE_EX_VAT + 1e-9;
     const linesOff = Number.isFinite(input.expectedLines) && itemsLines !== input.expectedLines;
+    // v6: חתימת "עוגן לפני הנחה" (נתפס בשטח 8.8): הפער מול העוגן שווה בדיוק
+    // לסד ההנחה שנקרא מהנייר, השורות נספרו נכון, ויש הנחה מודפסת — כלומר
+    // הוקלד סכום הטבלה שלפני ההנחה. קריאה מושלמת "תיכשל" כך לנצח, וסבבים
+    // חוזרים רק שורפים זמן וכסף על מספר שהוקלד. לא בתעודות זיכוי (הערכים שם
+    // עוברים ערך מוחלט והחתימה מאבדת משמעות).
+    const preDiscountAnchor = moneyOff
+      && !linesOff
+      && doc.docType !== "credit"
+      && Number.isFinite(doc.promoDiscountExVat)
+      && doc.promoDiscountExVat > 0
+      && Math.abs((expected - net) - promo) <= CHECKSUM_TOLERANCE_EX_VAT + 1e-9;
     // v3: בלוק הסיכום חתוך. אם השורות סוכמו יפה אבל בדיוק ההפרש מול העוגן
     // הוא סכום שלא הוסבר, והמסמך לא החזיר לא "סד הנחה" ולא "סהכ חייב מעמ" —
     // זה צילום שנקטע לפני בלוק הסיכום, לא קריאה שגויה. קריאות חוזרות במאמץ
@@ -306,9 +317,11 @@ export function scanChecksumMismatches(scan, inputDocuments) {
         noteIndex: doc.noteIndex,
         got: net,
         expected,
+        promo,
         gotLines: itemsLines,
         expectedLines: Number.isFinite(input.expectedLines) ? input.expectedLines : null,
         summaryBlockMissing,
+        preDiscountAnchor,
       });
     }
   }
@@ -1178,6 +1191,25 @@ function decodeAnalyzeClaims(result, aliasToId) {
         finishScan({ ok: false, serviceVersion: SERVICE_VERSION, error: "summary_block_missing", warnings: scan.warnings });
         return;
       }
+      // v6: העוגן שהוקלד הוא סכום הטבלה שלפני "סד הנחה" — ויתור מיידי עם
+      // הסבר והעוגן הנכון כפי שנקרא מהנייר, בלי סבב יקר (תוקן מספר לא יתוקן
+      // בקריאה חוזרת). ההודעה גם ב-message כדי שהלקוח יציג אותה כלשונה.
+      const preDiscount = firstMismatches.filter(item => item.preDiscountAnchor);
+      if (preDiscount.length && preDiscount.length === firstMismatches.length) {
+        for (const item of preDiscount) {
+          const warning = `בתעודה ${item.noteIndex + 1} נראה שהוקלד הסכום שלפני ההנחה (סכום הטבלה, ₪${item.expected.toFixed(2)}): שורות הפריטים פחות "סד הנחה בגין מבצעים" (₪${item.promo.toFixed(2)}) מסתכמות בדיוק ל-₪${item.got.toFixed(2)}. העוגן הנכון הוא "סהכ חייב מעמ".`;
+          if (!scan.warnings.includes(warning)) scan.warnings.push(warning);
+        }
+        const first = preDiscount[0];
+        finishScan({
+          ok: false,
+          serviceVersion: SERVICE_VERSION,
+          error: "anchor_pre_discount",
+          message: `נראה שהוקלד הסכום שלפני "סד הנחה בגין מבצעים" (סכום הטבלה). העוגן הנכון הוא "סהכ חייב מעמ" — בתעודה זו ככל הנראה ₪${first.got.toFixed(2)}. תקן את הסכום וסרוק שוב.`,
+          warnings: scan.warnings,
+        });
+        return;
+      }
       if (firstMismatches.length) {
         checksumRetryAttempted = true;
         const second = await attemptScan(checksumCorrectiveText(firstMismatches), CHECKSUM_RETRY_REASONING_EFFORT);
@@ -1188,9 +1220,11 @@ function decodeAnalyzeClaims(result, aliasToId) {
           }
         }
         for (const item of scanChecksumMismatches(scan, documents)) {
-          const warning = `סכום ביקורת: מסמך ${item.noteIndex + 1} הסתכם ל-₪${item.got.toFixed(2)} במקום ₪${item.expected.toFixed(2)}` +
-            (item.expectedLines != null && item.gotLines !== item.expectedLines ? ` (${item.gotLines} שורות במקום ${item.expectedLines})` : "") +
-            ` גם אחרי קריאה חוזרת — נדרשת בדיקה.`;
+          const warning = item.preDiscountAnchor
+            ? `בתעודה ${item.noteIndex + 1} נראה שהוקלד הסכום שלפני ההנחה (₪${item.expected.toFixed(2)}): השורות פחות סד ההנחה (₪${item.promo.toFixed(2)}) מסתכמות בדיוק ל-₪${item.got.toFixed(2)} — העוגן הנכון הוא "סהכ חייב מעמ".`
+            : `סכום ביקורת: מסמך ${item.noteIndex + 1} הסתכם ל-₪${item.got.toFixed(2)} במקום ₪${item.expected.toFixed(2)}` +
+              (item.expectedLines != null && item.gotLines !== item.expectedLines ? ` (${item.gotLines} שורות במקום ${item.expectedLines})` : "") +
+              ` גם אחרי קריאה חוזרת — נדרשת בדיקה.`;
           if (!scan.warnings.includes(warning)) scan.warnings.push(warning);
         }
       }
