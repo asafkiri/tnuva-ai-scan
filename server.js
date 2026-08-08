@@ -47,7 +47,7 @@ const OPENAI_MAX_OUTPUT_TOKENS = 48_000;
 const OPENAI_TIMEOUT_MS = 180_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 6; // v2: פעימות-חיים בתשובת הסריקה — ספארי iOS מנתק המתנה ללא בייט ראשון
+const SERVICE_VERSION = 7; // v2: פעימות-חיים בתשובת הסריקה — ספארי iOS מנתק המתנה ללא בייט ראשון
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -597,6 +597,22 @@ function getOpenAIServiceTier(env) {
   return configured === "priority" ? "priority" : DEFAULT_OPENAI_SERVICE_TIER;
 }
 
+// v7: קסקדת מודלים — הרעיון שלו (8.8): רוב הזמן זול, ובתעודה קשה המודל החזק.
+// OPENAI_RETRY_MODEL ריק = אין הסלמה (התנהגות היום); מוגדר (למשל gpt-5.6-sol)
+// = קריאת האימות החוזרת, זו שרצה רק כשהעוגן לא נסגר, עוברת אליו.
+// OPENAI_RETRY_SERVICE_TIER קובע מצב מהיר להסלמה בלבד; ריק = יורש את הרגיל.
+function getOpenAIRetryModel(env) {
+  const configured = typeof env.OPENAI_RETRY_MODEL === "string" ? env.OPENAI_RETRY_MODEL.trim() : "";
+  return configured;
+}
+
+function getOpenAIRetryServiceTier(env, baseTier) {
+  const configured = typeof env.OPENAI_RETRY_SERVICE_TIER === "string" ? env.OPENAI_RETRY_SERVICE_TIER.trim().toLowerCase() : "";
+  if (configured === "priority") return "priority";
+  if (configured === "default") return "default";
+  return baseTier;
+}
+
 // ===== v130: המנתח — בניית הקלט, אימות הפלט =====
 // אותה משמעת של הסריקה: המודל לעולם אינו רואה מזהה אמיתי. כאן הכינויים
 // משמשים את כל החלקים (מאגר, מבצעים, נסרק, תעודות) כדי שיוכל לקשור ביניהם.
@@ -835,6 +851,8 @@ function decodeAnalyzeClaims(result, aliasToId) {
       const { key: openaiKey, status: keyStatus } = getOpenAIKey(env);
       const openaiModel = getOpenAIModel(env);
       const openaiServiceTier = getOpenAIServiceTier(env);
+      const openaiRetryModel = getOpenAIRetryModel(env);
+      const openaiRetryTier = getOpenAIRetryServiceTier(env, openaiServiceTier);
 
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
         writeJson(response, origin, 200, {
@@ -845,6 +863,8 @@ function decodeAnalyzeClaims(result, aliasToId) {
           model: openaiModel,
           serviceTier: openaiServiceTier,
           fastMode: openaiServiceTier === "priority",
+          retryModel: openaiRetryModel || null,
+          retryServiceTier: openaiRetryModel ? openaiRetryTier : null,
           keyConfigured: keyStatus === "ready",
           keyStatus,
         });
@@ -1091,7 +1111,11 @@ function decodeAnalyzeClaims(result, aliasToId) {
 
       // אותה ארכיטקטורה כמו יטבתה v133: קריאה, אימות מול העוגן, ובמקרה כישלון —
       // קריאה מלאה נוספת אחת במאמץ גבוה; הקריאה הטובה יותר מנצחת.
-      const attemptScan = async (correctiveText, reasoningEffort) => {
+      const attemptScan = async (correctiveText, reasoningEffort, escalate) => {
+        // v7: escalate=true רק בקריאת האימות החוזרת. אם הוגדר מודל הסלמה —
+        // הקריאה הזאת רצה עליו (ובמצב המהיר של ההסלמה); אחרת הכול כרגיל.
+        const callModel = escalate && openaiRetryModel ? openaiRetryModel : openaiModel;
+        const callTier = escalate && openaiRetryModel ? openaiRetryTier : openaiServiceTier;
         const attemptContent = correctiveText
           ? content.concat([{ type: "input_text", text: correctiveText }])
           : content;
@@ -1107,8 +1131,8 @@ function decodeAnalyzeClaims(result, aliasToId) {
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
-              model: openaiModel,
-              ...(openaiServiceTier === "priority" ? { service_tier: "priority" } : {}), // v5: מתג המצב המהיר
+              model: callModel,
+              ...(callTier === "priority" ? { service_tier: "priority" } : {}), // v7: מתג המהיר של הקומה שנבחרה
               store: false,
               max_output_tokens: OPENAI_MAX_OUTPUT_TOKENS,
               reasoning: { effort: reasoningEffort },
@@ -1212,7 +1236,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
       }
       if (firstMismatches.length) {
         checksumRetryAttempted = true;
-        const second = await attemptScan(checksumCorrectiveText(firstMismatches), CHECKSUM_RETRY_REASONING_EFFORT);
+        const second = await attemptScan(checksumCorrectiveText(firstMismatches), CHECKSUM_RETRY_REASONING_EFFORT, true); // v7: הסלמה
         if (!second.fail) {
           const secondMismatches = scanChecksumMismatches(second.scan, documents);
           if (!secondMismatches.length || checksumTotalError(secondMismatches) < checksumTotalError(firstMismatches)) {
@@ -1237,6 +1261,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
         requestId: data.id || openaiResponse.headers.get("x-request-id") || null,
         usage: data.usage || null,
         checksumRetryAttempted,
+        checksumRetryModel: checksumRetryAttempted ? (openaiRetryModel || openaiModel) : null, // v7: מי ביצע את קריאת ההצלה
       });
     } catch (error) {
       logger.error("Unhandled scanner error", error);
