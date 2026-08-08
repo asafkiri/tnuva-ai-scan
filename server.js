@@ -30,21 +30,24 @@ const ANALYZE_BARCODE_SUFFIX_DIGITS = 5;
 const MAX_CATALOG_ITEMS = 5_000;
 const MIN_BARCODE_SUFFIX_DIGITS = 6;
 const MAX_BARCODE_DIGITS = 20;
-// v4: מצב מהיר — אותו מודל (Sol), עיבוד בעדיפות. חל על כל קריאות ה-OpenAI.
-const OPENAI_SERVICE_TIER = "priority";
+// v5: מצב מהיר הפך למתג סביבה, כבוי כברירת מחדל. OPENAI_SERVICE_TIER=priority
+// ב-Cloud Run מדליק אותו לכל קריאות ה-OpenAI; כל ערך אחר (או היעדרו) = רגיל.
+const DEFAULT_OPENAI_SERVICE_TIER = "default";
 
 const MAX_PAGES = 8;
 const MAX_BODY_BYTES = 30 * 1024 * 1024;
 const MAX_PAGE_BYTES = 2_600_000;
 const OPENAI_URL = "https://api.openai.com/v1/responses";
-const DEFAULT_OPENAI_MODEL = "gpt-5.6-sol";
+// v5: ברירת המחדל היא Terra — הניסוי שהוחלט 8.8 ("העלויות יקרות מדי ב-Sol Fast").
+// חזרה ל-Sol = משתנה סביבה OPENAI_MODEL=gpt-5.6-sol ב-Cloud Run, בלי קובץ חדש.
+const DEFAULT_OPENAI_MODEL = "gpt-5.6-terra";
 const OPENAI_IMAGE_DETAIL = "original";
 const OPENAI_REASONING_EFFORT = "medium";
 const OPENAI_MAX_OUTPUT_TOKENS = 48_000;
 const OPENAI_TIMEOUT_MS = 180_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 4; // v2: פעימות-חיים בתשובת הסריקה — ספארי iOS מנתק המתנה ללא בייט ראשון
+const SERVICE_VERSION = 5; // v2: פעימות-חיים בתשובת הסריקה — ספארי iOS מנתק המתנה ללא בייט ראשון
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -576,6 +579,11 @@ function getOpenAIModel(env) {
   return configured || DEFAULT_OPENAI_MODEL;
 }
 
+function getOpenAIServiceTier(env) {
+  const configured = typeof env.OPENAI_SERVICE_TIER === "string" ? env.OPENAI_SERVICE_TIER.trim().toLowerCase() : "";
+  return configured === "priority" ? "priority" : DEFAULT_OPENAI_SERVICE_TIER;
+}
+
 // ===== v130: המנתח — בניית הקלט, אימות הפלט =====
 // אותה משמעת של הסריקה: המודל לעולם אינו רואה מזהה אמיתי. כאן הכינויים
 // משמשים את כל החלקים (מאגר, מבצעים, נסרק, תעודות) כדי שיוכל לקשור ביניהם.
@@ -813,6 +821,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
 
       const { key: openaiKey, status: keyStatus } = getOpenAIKey(env);
       const openaiModel = getOpenAIModel(env);
+      const openaiServiceTier = getOpenAIServiceTier(env);
 
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
         writeJson(response, origin, 200, {
@@ -821,7 +830,8 @@ function decodeAnalyzeClaims(result, aliasToId) {
           version: SERVICE_VERSION,
           serviceVersion: SERVICE_VERSION,
           model: openaiModel,
-          fastMode: OPENAI_SERVICE_TIER === "priority",
+          serviceTier: openaiServiceTier,
+          fastMode: openaiServiceTier === "priority",
           keyConfigured: keyStatus === "ready",
           keyStatus,
         });
@@ -904,7 +914,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
             },
             body: JSON.stringify({
               model: openaiModel,
-              service_tier: OPENAI_SERVICE_TIER, // v4: מצב מהיר
+              ...(openaiServiceTier === "priority" ? { service_tier: "priority" } : {}), // v5: מתג המצב המהיר
               store: false,
               max_output_tokens: ANALYZE_MAX_OUTPUT_TOKENS,
               reasoning: { effort: OPENAI_REASONING_EFFORT },
@@ -1085,7 +1095,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
             },
             body: JSON.stringify({
               model: openaiModel,
-              service_tier: OPENAI_SERVICE_TIER, // v4: מצב מהיר — אותו Sol, עיבוד בעדיפות
+              ...(openaiServiceTier === "priority" ? { service_tier: "priority" } : {}), // v5: מתג המצב המהיר
               store: false,
               max_output_tokens: OPENAI_MAX_OUTPUT_TOKENS,
               reasoning: { effort: reasoningEffort },
