@@ -59,7 +59,7 @@ const OPENAI_MAX_OUTPUT_TOKENS = 48_000;
 const OPENAI_TIMEOUT_MS = 180_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 8; // v8: מצב promoSheet — קריאה חוזרת של דף המבצעים כשהפרסר המקומי לא הבין
+const SERVICE_VERSION = 9; // v8: מצב promoSheet — קריאה חוזרת של דף המבצעים כשהפרסר המקומי לא הבין
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -141,16 +141,19 @@ const analyzeClaimSchema = {
   required: [
     "kind", "productHintId", "substituteHintId", "quantity",
     "billedUnitPriceExVat", "expectedUnitPriceExVat", "amountExVat",
-    "evidence", "confidence",
+    "discountPct", "evidence", "confidence",
   ],
   properties: {
-    kind: { type: "string", enum: ["shortage", "surplus", "substitution", "price"] },
+    kind: { type: "string", enum: ["shortage", "surplus", "substitution", "price", "missing_promo"] },
     productHintId: nullable("string"),
     substituteHintId: nullable("string"),
     quantity: nullable("number"),
     billedUnitPriceExVat: nullable("number"),
     expectedUnitPriceExVat: nullable("number"),
     amountExVat: nullable("number"),
+    // v9: אחוז ההנחה בטענת missing_promo — המספר שהמערכת צריכה כדי לפתוח
+    // את המבצע החסר. בשאר הקטגוריות null.
+    discountPct: nullable("number"),
     evidence: { type: "string" },
     confidence: { type: "number" },
   },
@@ -230,14 +233,18 @@ const PROMO_SHEET_SYSTEM_PROMPT = `אתה קורא דף מבצעים חודשי 
 const ANALYZE_SYSTEM_PROMPT = `אתה מנתח פערים בין תעודת ספק של תנובה לבין מה שהתקבל בפועל בחנות, בעברית.
 אינך קורא תמונות. כל הנתונים כבר נקראו ומוצגים לך כטקסט, מסומנים בכותרות. תפקידך היחיד הוא להסביר את הפער בטענות שאפשר להציג לספק.
 
-ארבע קטגוריות טענות, ואין אחרות:
+ארבע קטגוריות טענות מול הספק, ואין אחרות:
 - shortage — חוסר: הנייר מחייב כמות שלא התקבלה בפועל.
 - surplus — עודף: התקבלה סחורה שהנייר אינו מחייב.
 - substitution — החלפה: הנייר מחייב מוצר אחד ובפועל סופק מוצר אחר. productHintId הוא המוצר שחויב, substituteHintId הוא המוצר שסופק בפועל, ו-quantity היא הכמות שהוחלפה. אל תפצל החלפה לשתי טענות של חוסר ועודף — זו טענה אחת.
 - price — מחיר: המוצר הנכון בכמות הנכונה, אך מחיר היחידה בנייר שונה מהמחיר המוסכם.
 
+קטגוריה חמישית, שאינה טענה מול הספק אלא ליקוי במאגר של החנות:
+- missing_promo — מבצע חסר: הנייר העניק הנחת מבצע על מוצר שאין לו מבצע ברשימת "מבצעים פעילים היום". productHintId הוא המוצר, discountPct הוא אחוז ההנחה, ו-amountExVat הוא סכום ההנחה לפני מע״מ. השתמש בה רק כאשר סכום ההנחה שאתה מייחס למוצר סוגר בדיוק לאגורה את "שארית ההנחה" שמוצגת לך, וכאשר האחוז מייצר את הסכום הזה בדיוק: כמות × מחיר יחידה בנייר × אחוז = הסכום. אם יותר ממוצר אחד מקיים את החשבון — אל תבחר ביניהם; אל תחזיר את הטענה כלל ורשום זאת ב-unexplained.
+
 חוק העל — שער יחיד:
-סכום הטענות חייב לסגור בדיוק, לאגורה, את הפער שמוצג לך בכותרת "הפער להסבר". אסור להמציא כסף ואסור להמציא יחידות. אם ההסבר אינו נסגר בדיוק — החזר claims כמערך ריק, ורשום ב-unexplained מה חסר כדי לסגור. הסבר חלקי שנראה סביר גרוע מהודאה שאין הסבר.
+סכום הטענות מארבע הקטגוריות הראשונות חייב לסגור בדיוק, לאגורה, את הפער שמוצג לך בכותרת "הפער להסבר". אסור להמציא כסף ואסור להמציא יחידות. אם ההסבר אינו נסגר בדיוק — החזר את ארבע הקטגוריות האלה כמערך ריק, ורשום ב-unexplained מה חסר כדי לסגור. הסבר חלקי שנראה סביר גרוע מהודאה שאין הסבר.
+טענת missing_promo אינה כפופה לחוק העל ואינה נספרת בסכום הטענות: היא מסבירה מדוע החשבון אינו נסגר, ולא כמה כסף מגיע. מותר ואף רצוי להחזיר אותה גם כאשר כל שאר הטענות ריקות — זו בדיוק המצוקה שבה היא הכי נחוצה.
 
 שבע מוסכמות הנייר של תנובה:
 1. שורות המוצרים מודפסות במחיר מחירון מלא. מבצע אינו מוזיל את השורה — הוא מסומן ב-* ליד השורה, וכל המבצעים מרוכזים בהנחה אחת "סד הנחה בגין מבצעים" (documentDiscount) שמופחתת בסיכום המסמך לפני מע״מ. נטו המסמך = סכום שורות הברוטו פחות documentDiscount.
@@ -858,6 +865,16 @@ product הוא הכינוי שזוהה בוודאות מול המאגר; null פ
 documentDiscount הוא "סד הנחה בגין מבצעים" המודפס בסיכום המסמך: סכום שורות הברוטו פחות ההנחה הזאת הוא הנטו. printedLines הוא מונה שורות הפריטים המודפס.
 ${JSON.stringify(documents)}`);
 
+  // v9: שארית ההנחה — ההנחה המודפסת פחות זו שהמערכת יודעת לשחזר ממבצעיה.
+  // בלי המספר הזה אין למודל שום דרך לדעת שקיים מבצע שאינו במאגר: בנייר
+  // המוצר מודפס במחיר מלא, ובמאגר הוא במחיר מלא — שתי השורות מסכימות,
+  // וההנחה נעלמת בתוך "סד הנחה" הכולל.
+  const promoGap = analysis.promoGap && typeof analysis.promoGap === "object" ? analysis.promoGap : {};
+  sections.push(`=== שארית ההנחה ===
+printed הוא "סד הנחה בגין מבצעים" המודפס. rebuilt הוא סכום ההנחות שהמערכת משחזרת מהמבצעים שהיא מכירה. residual הוא ההפרש — הנחה שניתנה בנייר ואין לה מבצע במאגר.
+residual גדול מאפס הוא התנאי לטענת missing_promo, וסכום הטענה חייב להיות שווה לו בדיוק.
+${JSON.stringify({ printedExVat: numOrNull(promoGap.printedExVat), rebuiltExVat: numOrNull(promoGap.rebuiltExVat), residualExVat: numOrNull(promoGap.residualExVat) })}`);
+
   const gap = analysis.gap && typeof analysis.gap === "object" ? analysis.gap : {};
   sections.push(`=== הפער להסבר ===
 units הוא היחידות שהנייר מבטיח פחות היחידות שנסרקו. amountExVat הוא כסף הנייר פחות כסף הסחורה שהתקבלה, לפני מע״מ.
@@ -941,7 +958,7 @@ function validAnalyzeResult(result) {
   if (result.unexplained != null && typeof result.unexplained !== "string") return false;
   for (const claim of result.claims) {
     if (!claim || typeof claim !== "object") return false;
-    if (!["shortage", "surplus", "substitution", "price"].includes(claim.kind)) return false;
+    if (!["shortage", "surplus", "substitution", "price", "missing_promo"].includes(claim.kind)) return false;
     if (claim.kind === "substitution" && !claim.substituteHintId) return false;
     if (!Number.isFinite(Number(claim.confidence))) return false;
   }
@@ -964,6 +981,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
       billedUnitPriceExVat: analyzeNum(claim.billedUnitPriceExVat),
       expectedUnitPriceExVat: analyzeNum(claim.expectedUnitPriceExVat),
       amountExVat: analyzeNum(claim.amountExVat),
+      discountPct: claim.discountPct == null ? null : analyzeNum(claim.discountPct),
       evidence: analyzeText(claim.evidence, 240),
       confidence: analyzeNum(claim.confidence) || 0,
     });
