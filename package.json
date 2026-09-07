@@ -5,5 +5,5 @@
   "type": "module",
   "main": "server.js",
   "engines": { "node": ">=20" },
-  "scripts": { "start": "node server.js" }
+  "scripts": { "start": "node server.js", "test": "node --test test-photo-first.mjs" }
 }

@@ -59,7 +59,7 @@ const OPENAI_MAX_OUTPUT_TOKENS = 48_000;
 const OPENAI_TIMEOUT_MS = 180_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 9; // v8: מצב promoSheet — קריאה חוזרת של דף המבצעים כשהפרסר המקומי לא הבין
+const SERVICE_VERSION = 10; // Photo-first Tnuva validation and per-attempt scan audit.
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -343,11 +343,72 @@ export function validModelScan(scan, inputDocuments) {
 //   Σ(שורות פריטים) − סד הנחה − Σ(שורות החזרות) ≈ העוגן (סבילות 2 אגורות).
 // מונה השורות שהוקלד ("פריטים") נבדק מול שורות הפריטים בלבד, במדויק.
 // חשבונית זיכוי מודפסת עם מינוס בסיכום ושורות ללא סימן — ההשוואה בערך מוחלט.
+export function tnuvaPaperCheck(input, pageCount) {
+  // Use the untouched supplier output, before the client maps product codes.
+  const doc = input && (input.__tnuvaPaper || input);
+  const problems = [], review = [];
+  const cents = value => value == null || value === '' || !Number.isFinite(Number(value)) ? null : Math.round(Number(value) * 100);
+  const rows = doc && Array.isArray(doc.rows) ? doc.rows : [];
+  const subtotal = cents(doc && doc.subtotalExVat);
+  const printedLines = doc && doc.itemsPrintedLines;
+  const missingSummary = subtotal == null || !Number.isInteger(printedLines) || printedLines <= 0;
+  if (subtotal == null) problems.push('לא נקרא סהכ חייב מעמ — יש להשלים צילום של הסיכום');
+  if (!Number.isInteger(printedLines) || printedLines <= 0) problems.push('לא נקרא מונה הפריטים המודפס — יש להשלים את הסיכום');
+  if (!doc || doc.pageCount !== pageCount || !(pageCount > 0)) problems.push('מספר עמודי התעודה אינו תואם לצילומים');
+  if (!rows.length) problems.push('לא נקראו שורות מוצרים');
+  let itemsCents = 0, returnsCents = 0, itemLines = 0, returnLines = 0, units = 0;
+  rows.forEach((row, index) => {
+    const amount = cents(row && row.lineTotalExVat);
+    const qty = row && row.quantity;
+    if (!row || !['items', 'returns'].includes(row.section)) problems.push('שורה ' + (index + 1) + ': המקטע אינו ברור');
+    if (!row || !Number.isInteger(row.sourcePage) || row.sourcePage < 1 || row.sourcePage > pageCount) problems.push('שורה ' + (index + 1) + ': העמוד אינו תקין');
+    if (amount == null || amount < 0) problems.push('שורה ' + (index + 1) + ': סכום השורה חסר או אינו תקין');
+    if (qty == null || !Number.isFinite(qty) || qty < 0) problems.push('שורה ' + (index + 1) + ': הכמות חסרה או אינה תקינה');
+    // Tnuva prints gross amounts in each item row, with discounts only below
+    // the table. Check quantity against the printed unit price, allowing its
+    // documented rounding; never replace any of the three printed values.
+    const unit = row && row.unitPriceExVat;
+    if (qty != null && Number.isFinite(qty) && unit != null && Number.isFinite(unit) && amount != null) {
+      const roundedUnit = Math.abs(unit * 100 - Math.round(unit * 100)) < 0.000001;
+      const tolerance = roundedUnit ? Math.max(1, Math.ceil(Math.abs(qty) * 0.5 + 0.5)) : 1;
+      if (Math.abs(Math.round(unit * qty * 100) - amount) > tolerance) problems.push('שורה ' + (index + 1) + ': כמות כפול מחיר אינה תואמת לסכום המודפס');
+    }
+    if (row && row.section === 'returns') { returnLines++; returnsCents += amount || 0; }
+    else { itemLines++; itemsCents += amount || 0; if (qty != null && !/פ.?קדון/.test(String(row && row.description || ''))) units += Number(qty) || 0; }
+  });
+  if (Number.isInteger(printedLines) && itemLines !== printedLines) problems.push('נקראו ' + itemLines + ' שורות פריטים מול ' + printedLines + ' במונה המודפס');
+  if (doc && doc.returnsPrintedLines != null && returnLines !== doc.returnsPrintedLines) problems.push('מונה שורות ההחזרות אינו תואם');
+  const itemSummary = cents(doc && doc.itemsSectionTotalExVat), returnSummary = cents(doc && doc.returnsSectionTotalExVat);
+  if (itemSummary != null && Math.abs(itemSummary) !== itemsCents) problems.push('שורות הפריטים אינן נסגרות מול סיכום המקטע');
+  if (returnSummary != null && Math.abs(returnSummary) !== returnsCents) problems.push('שורות ההחזרות אינן נסגרות מול סיכום המקטע');
+  const promo = Math.abs(cents(doc && doc.promoDiscountExVat) || 0);
+  const net = itemsCents - promo - returnsCents;
+  const credit = doc && doc.docType === 'credit';
+  const expected = credit && subtotal != null ? Math.abs(subtotal) : subtotal;
+  if (expected != null && net !== expected) problems.push('סכומי השורות פחות הנחת המבצעים וההחזרות אינם שווים לסהכ חייב מעמ');
+  if (credit) review.push('זו חשבונית זיכוי — יש להזין אותה במסך החזרות, ולא כקליטת סחורה');
+  else if (!doc || doc.docType !== 'invoice') review.push('סוג התעודה לא זוהה בוודאות — יש לבדוק את הכותרת');
+  if (returnLines || (returnSummary != null && returnSummary !== 0)) review.push('התעודה כוללת החזרות. יש להפריד אותן לפי תהליך ההחזרות הקיים ולהזין ידנית את נתוני הקליטה');
+  if (!credit && subtotal != null && subtotal <= 0) review.push('סכום התעודה אינו חיובי — יש לבדוק את סוג התעודה');
+  return { ok: problems.length === 0, receivable: !problems.length && !review.length,
+    problems, review, missingSummary, retryable: problems.length > 0 && !missingSummary,
+    amount: subtotal == null ? null : subtotal / 100, lines: printedLines == null ? null : printedLines,
+    units, rowAmount: net / 100, rowLines: itemLines, returnLines, promo: promo / 100 };
+}
+
 export function scanChecksumMismatches(scan, inputDocuments) {
   const out = [];
   for (const doc of (scan && scan.documents) || []) {
     const input = (inputDocuments || []).find(candidate => candidate.noteIndex === doc.noteIndex);
-    if (!input || !Number.isFinite(input.expectedSubtotalExVat)) continue;
+    if (!input) continue;
+    if (!Number.isFinite(input.expectedSubtotalExVat)) {
+      const check = tnuvaPaperCheck(doc, input.pages.length);
+      if (!check.ok) out.push({ noteIndex: doc.noteIndex, got: check.rowAmount,
+        expected: check.amount || 0, gotLines: check.rowLines, expectedLines: check.lines,
+        promo: check.promo, missingSummary: check.missingSummary, retryable: check.retryable,
+        problems: check.problems, photoFirst: true });
+      continue;
+    }
     let itemsSum = 0;
     let returnsSum = 0;
     let itemsLines = 0;
@@ -408,7 +469,7 @@ export function scanChecksumMismatches(scan, inputDocuments) {
 }
 
 function checksumTotalError(mismatches) {
-  return (mismatches || []).reduce((total, item) => total + Math.abs(item.got - item.expected), 0);
+  return (mismatches || []).reduce((total, item) => total + Math.abs(item.got - item.expected) + Math.abs((item.gotLines || 0) - (item.expectedLines || 0)) + (item.problems || []).length + (item.missingSummary ? 1000000 : 0), 0);
 }
 
 
@@ -417,7 +478,8 @@ function checksumCorrectiveText(mismatches) {
     `מסמך noteIndex=${item.noteIndex}: לפי הנוסחה (שורות פריטים פחות סד הנחה פחות החזרות) התקבלו ${item.got.toFixed(2)} ₪` +
     (item.expectedLines != null ? ` ו-${item.gotLines} שורות פריטים` : "") +
     ` במקום ${item.expected.toFixed(2)} ₪` +
-    (item.expectedLines != null ? ` ו-${item.expectedLines} שורות` : "") + ".");
+    (item.expectedLines != null ? ` ו-${item.expectedLines} שורות` : "") + "." +
+    (item.problems?.length ? ` בדיקות שלא נסגרו: ${item.problems.join('; ')}.` : ""));
   return `אזהרת סכום ביקורת: בקריאה הקודמת ${parts.join(" ")} קרא הכל מחדש בזהירות שורה-שורה: ודא שאף שורת מוצר לא הושמטה או שוכפלה, ששורת "סד הנחה בגין מבצעים" נקראה במדויק ולא נספרה כשורת מוצר, ששורות ההחזרות שויכו ל-section="returns", ושכל סכום הועתק בדיוק כפי שמודפס.`;
 }
 
@@ -1020,6 +1082,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
           model: openaiModel,
           serviceTier: openaiServiceTier,
           fastMode: openaiServiceTier === "priority",
+          photoFirst: true, scanAuditVersion: 1,
           retryModel: openaiRetryModel || null,
           retryServiceTier: openaiRetryModel ? openaiRetryTier : null,
           keyConfigured: keyStatus === "ready",
@@ -1344,7 +1407,13 @@ function decodeAnalyzeClaims(result, aliasToId) {
         "Cache-Control": "no-store",
       }, corsHeaders(origin)));
       scanHeartbeat = setInterval(() => { try { response.write(" "); } catch (error) {} }, 10_000);
+      const scanAudit = { version: 1, id: crypto.randomUUID(), startedAt: now(), attempts: [] };
       const finishScan = (value) => {
+        scanAudit.completedAt = now();
+        scanAudit.result = !value.ok ? (value.error || 'failed') : value.paperValidation
+          ? (value.paperValidation.every(check => check.receivable) ? 'paper_verified' : 'paper_needs_review') : 'completed';
+        value.scanAudit = scanAudit;
+        logger.info?.('invoice_scan_audit', scanAudit);
         clearInterval(scanHeartbeat);
         scanHeartbeat = null;
         try { response.end(JSON.stringify(value)); } catch (error) {}
@@ -1370,13 +1439,16 @@ function decodeAnalyzeClaims(result, aliasToId) {
       // אותה ארכיטקטורה כמו יטבתה v133: קריאה, אימות מול העוגן, ובמקרה כישלון —
       // קריאה מלאה נוספת אחת במאמץ גבוה; הקריאה הטובה יותר מנצחת.
       const attemptScan = async (correctiveText, reasoningEffort, escalate) => {
-        // v7: escalate=true רק בקריאת האימות החוזרת. אם הוגדר מודל הסלמה —
+        // v135: escalate=true רק בקריאת האימות החוזרת. אם הוגדר מודל הסלמה —
         // הקריאה הזאת רצה עליו (ובמצב המהיר של ההסלמה); אחרת הכול כרגיל.
         const callModel = escalate && openaiRetryModel ? openaiRetryModel : openaiModel;
         const callTier = escalate && openaiRetryModel ? openaiRetryTier : openaiServiceTier;
         const attemptContent = correctiveText
           ? content.concat([{ type: "input_text", text: correctiveText }])
           : content;
+        const audit = { stage: escalate ? 'checksum_retry' : 'initial', requestedModel: callModel,
+          model: callModel, serviceTier: callTier, startedAt: now(), selected: false };
+        scanAudit.attempts.push(audit);
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
         let openaiResponse;
@@ -1390,7 +1462,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
             },
             body: JSON.stringify({
               model: callModel,
-              ...(callTier === "priority" ? { service_tier: "priority" } : {}), // v7: מתג המהיר של הקומה שנבחרה
+              ...(callTier === "priority" ? { service_tier: "priority" } : {}), // v135: מתג המהיר של הקומה שנבחרה
               store: false,
               max_output_tokens: OPENAI_MAX_OUTPUT_TOKENS,
               reasoning: { effort: reasoningEffort },
@@ -1409,18 +1481,27 @@ function decodeAnalyzeClaims(result, aliasToId) {
             }),
             signal: controller.signal,
           });
+          audit.requestId = openaiResponse.headers.get("x-request-id") || null;
+          // The deadline covers the streamed body as well as response headers.
           try {
             data = await openaiResponse.json();
           } catch (error) {
             if (error && error.name === "AbortError") throw error;
           }
         } catch (error) {
+          audit.outcome = error && error.name === "AbortError" ? "timeout" : "network_error";
           return { fail: { status: error && error.name === "AbortError" ? 504 : 502, body: {
             ok: false,
             error: error && error.name === "AbortError" ? "openai_timeout" : "openai_network_error",
           } } };
         } finally {
           clearTimeout(timeout);
+          audit.completedAt = now();
+          audit.model = data.model || callModel;
+          audit.requestId = data.id || audit.requestId || null;
+          audit.usage = data.usage || null;
+          audit.outcome = audit.outcome || (!openaiResponse?.ok ? 'openai_error' :
+            data.status === 'incomplete' ? 'incomplete_output' : hasModelRefusal(data) ? 'refusal' : 'invalid_output');
         }
         if (!openaiResponse.ok) {
           return { fail: { status: openaiResponse.status, body: {
@@ -1451,7 +1532,8 @@ function decodeAnalyzeClaims(result, aliasToId) {
         if (!validModelScan(scan, documents)) {
           return { fail: { status: 502, body: { ok: false, error: "invalid_model_output", requestId: data.id || null } } };
         }
-        return { scan, data, openaiResponse };
+        audit.outcome = 'read';
+        return { scan, data, openaiResponse, audit };
       };
 
       let attempt = await attemptScan(null, OPENAI_REASONING_EFFORT);
@@ -1460,9 +1542,28 @@ function decodeAnalyzeClaims(result, aliasToId) {
         return;
       }
       let { scan, data, openaiResponse } = attempt;
+      attempt.audit.selected = true;
+      const photoFirst = documents.every(doc => !Number.isFinite(doc.expectedSubtotalExVat));
+      const paperChecks = value => value.documents.map(doc => ({ noteIndex: doc.noteIndex,
+        ...tnuvaPaperCheck(doc, documents.find(input => input.noteIndex === doc.noteIndex).pages.length) }));
+      const badAnchor = scan.documents.find(doc => {
+        const input = documents.find(d => d.noteIndex === doc.noteIndex);
+        const check = tnuvaPaperCheck(doc, input.pages.length);
+        return Number.isFinite(input.expectedSubtotalExVat) && check.ok
+          && (Math.abs(Math.abs(Math.round(doc.subtotalExVat * 100)) - Math.abs(Math.round(input.expectedSubtotalExVat * 100))) > 2
+            || (Number.isFinite(input.expectedLines) && input.expectedLines !== doc.itemsPrintedLines));
+      });
+      if (badAnchor) {
+        attempt.audit.outcome = 'anchor_mismatch';
+        finishScan({ ok: false, error: 'anchor_mismatch_printed', serviceVersion: SERVICE_VERSION,
+          message: `התעודה נסגרת לפי הסיכום המודפס: ₪${badAnchor.subtotalExVat.toFixed(2)} ו-${badAnchor.itemsPrintedLines} שורות פריטים. הנתונים שהוקלדו שונים — בדוק אותם לפני סריקה נוספת.` });
+        return;
+      }
 
       let checksumRetryAttempted = false;
       const firstMismatches = scanChecksumMismatches(scan, documents);
+      attempt.audit.validation = photoFirst ? paperChecks(scan) : firstMismatches;
+      attempt.audit.outcome = firstMismatches.length ? 'validation_mismatch' : 'read';
       // v3: צילום שנקטע לפני בלוק הסיכום — ויתור מיידי עם הסבר, בלי סבב יקר.
       const cutOff = firstMismatches.filter(item => item.summaryBlockMissing);
       if (cutOff.length && cutOff.length === firstMismatches.length) {
@@ -1492,12 +1593,16 @@ function decodeAnalyzeClaims(result, aliasToId) {
         });
         return;
       }
-      if (firstMismatches.length) {
+      if (firstMismatches.some(item => item.retryable !== false)) {
         checksumRetryAttempted = true;
         const second = await attemptScan(checksumCorrectiveText(firstMismatches), CHECKSUM_RETRY_REASONING_EFFORT, true); // v7: הסלמה
         if (!second.fail) {
           const secondMismatches = scanChecksumMismatches(second.scan, documents);
-          if (!secondMismatches.length || checksumTotalError(secondMismatches) < checksumTotalError(firstMismatches)) {
+          second.audit.validation = photoFirst ? paperChecks(second.scan) : secondMismatches;
+          second.audit.outcome = secondMismatches.length ? 'validation_mismatch' : 'read';
+          const lostSummary = photoFirst && paperChecks(second.scan).some(check => check.missingSummary);
+          if (!lostSummary && (!secondMismatches.length || checksumTotalError(secondMismatches) < checksumTotalError(firstMismatches))) {
+            attempt.audit.selected = false; second.audit.selected = true;
             ({ scan, data, openaiResponse } = second);
           }
         }
@@ -1515,7 +1620,8 @@ function decodeAnalyzeClaims(result, aliasToId) {
         ok: true,
         serviceVersion: SERVICE_VERSION,
         scan,
-        model: data.model || openaiModel,
+        model: data.model || scanAudit.attempts.find(a => a.selected)?.requestedModel || openaiModel,
+        paperValidation: photoFirst ? paperChecks(scan) : null,
         requestId: data.id || openaiResponse.headers.get("x-request-id") || null,
         usage: data.usage || null,
         checksumRetryAttempted,
