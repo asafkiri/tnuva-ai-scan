@@ -1,4 +1,33 @@
-# Tnuva invoice scanner — service 13
+# Tnuva invoice scanner — service 14
+
+Rows are compared by content, not by position. Until service 13 the two reads
+of a photo were compared row i against row i, and a document whose reads
+disagreed on the row count was disputed as a whole: on 17.9 one read saw 29
+rows on a 28-row paper, and all 28 rows went to manual approval although the
+selected read closed against the printed subtotal to the agora. Now reads
+with the same row count are still compared row by row — a column shift keeps
+the row count, and inside a run of rows with identical money only the
+positional comparison sees the shifted code — while reads whose row counts
+differ are aligned by similarity (code, quantity, unit price, line total)
+keeping table order, so a row that one read split, duplicated or dropped
+disturbs only itself. A field of a row is disputed only when another
+read disagrees and no other read confirms the selected value: two of three
+reads agreeing — the expensive one and a cheap one — settle it, and the
+decision is not asked again. Against a single other read every difference
+stays disputed, because there is no third opinion. The code is the exception:
+every dissenting code is reported, with `confirmed` counting the reads that
+agree with the selected one, because the app settles a code against the
+catalog and the printed price and needs the rival code to do so — the `other`
+value is the first code actually read, never the null of a read that could
+not read it. A row that only the selected read saw is disputed on its
+existence, unless the selected document closes against its printed line
+counter and subtotal: such a paper cannot hold an invented row, so the row
+exists — but its identity stays a code question against "not read". A row
+every other read saw and the selected read dropped is returned in
+`consensus.missingRows` with a warning when the paper does not close, so the
+gap in the sum comes with the row that explains it. Disputes are measured
+against the read that actually won, also when the checksum retry replaced two
+cheap reads that agreed with each other.
 
 A scan outlives the connection that asked for it. Two parallel reads plus an
 escalation take a minute and a half to two minutes, and a phone in a store does
@@ -20,10 +49,10 @@ confidence are excluded, because they differ between correct reads. Identical
 reads are accepted with no escalation. Any difference — or a read that failed,
 leaving no second opinion — escalates to one call on the retry model with a
 corrective note naming the differences and the known column-shift failure, and
-that read wins. Rows the reads disagreed on are returned in
-`consensus.disputedRows` and raise a warning, because a paper whose money
-closes perfectly can still carry an identity read from the wrong row.
-`OPENAI_CONSENSUS_READS=1` restores the single-read behaviour.
+that read wins. Rows the reads disagreed on and no second read confirms are
+returned in `consensus.disputedRows` and raise a warning, because a paper
+whose money closes perfectly can still carry an identity read from the wrong
+row. `OPENAI_CONSENSUS_READS=1` restores the single-read behaviour.
 
 A call that never reached the model is not an answer: a read that fails with a
 network error inside the first minute is retried once, because a fast failure
@@ -62,7 +91,7 @@ unchanged.
 fixture Firebase signatures and mocked model responses. No paid requests.
 
 Deploy this source to the existing `tnuva-ai-scan` service first. `/health`
-must report `serviceVersion:13`, `resumableScans:true`, `photoFirst:true`,
+must report `serviceVersion:14`, `resumableScans:true`, `photoFirst:true`,
 `scanAuditVersion:1`, `keyStatus:"ready"`, and `retryModel:"gpt-5.6-terra"` —
 without a retry model the escalation runs on the base model and buys nothing.
 Preserve the verified runtime configuration:
