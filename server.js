@@ -62,7 +62,18 @@ const OPENAI_TIMEOUT_MS = 180_000;
 export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 12; // Retry a dropped call to the model before failing the scan.
+const SERVICE_VERSION = 13; // The scan outlives the connection: reconnect with the same key.
+// v13: עבודת סריקה נשמרת חצי שעה אחרי שהסתיימה, ושעה לכל היותר מרגע שנפתחה.
+// זה מכסה בנוחות טלפון שנפל וחוזר, ואינו מחזיק זיכרון מעבר לכך.
+const SCAN_JOB_TTL_MS = 30 * 60 * 1000;
+const SCAN_JOB_MAX_AGE_MS = 60 * 60 * 1000;
+const SCAN_JOB_LIMIT = 24;
+export function scanJobKey(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(value) ? value : null;
+}
+export function scanJobId(uid, key) {
+  return `${uid}|${key}`; // אף אחד מהשניים אינו מכיל "|", ולכן אין התנגשות
+}
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -884,6 +895,68 @@ export function createServer({
   const verifyFirebaseToken = createFirebaseVerifier({ fetchImpl, now });
   const enforceRateLimit = createRateLimiter(now);
 
+  // ===== v13: מאגר העבודות =====
+  // עבודה אחת = סריקה אחת של תעודה אחת, מזוהה במפתח שהלקוח הגריל. התוצאה
+  // נשמרת בלי התמונות (רק ה-JSON שחוזר ממילא ללקוח), ולכן המאגר קטן. הוא
+  // חי בזיכרון המופע: מופע שנפל מאבד אותו, והלקוח פשוט שולח שוב את הצילומים.
+  const scanJobs = new Map();
+  function pruneScanJobs() {
+    const nowMs = now();
+    for (const [id, job] of scanJobs) {
+      const age = nowMs - job.createdAt;
+      const finished = job.settled && nowMs - job.settledAt > SCAN_JOB_TTL_MS;
+      if (finished || age > SCAN_JOB_MAX_AGE_MS) scanJobs.delete(id);
+    }
+    while (scanJobs.size >= SCAN_JOB_LIMIT) {
+      const oldest = scanJobs.keys().next();
+      if (oldest.done) break;
+      scanJobs.delete(oldest.value);
+    }
+  }
+  function createScanJob(id) {
+    const job = { id, createdAt: now(), settledAt: null, settled: false, payload: null };
+    job.promise = new Promise(resolve => { job.resolve = resolve; });
+    if (id) { pruneScanJobs(); scanJobs.set(id, job); }
+    return job;
+  }
+  function settleScanJob(job, payload) {
+    if (!job || job.settled) return;
+    job.settled = true;
+    job.settledAt = now();
+    job.payload = payload;
+    job.resolve(payload);
+  }
+  // חיבור נצמד לעבודה: כותרות ופעימות-חיים יוצאות מיד, והתשובה נסגרת כשהעבודה
+  // מסתיימת — בין אם זה החיבור שפתח אותה ובין אם זה חיבור שחזר אחרי נפילה.
+  // חיבור שמת רק מנקה את עצמו; העבודה ממשיכה, וזה כל העניין.
+  function streamScanJob(job, request, response, origin) {
+    response.on("error", () => {});
+    if (!response.headersSent) {
+      response.writeHead(200, Object.assign({
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+      }, corsHeaders(origin)));
+    }
+    // החיבור עלול למות עוד לפני שהגענו לכאן (קריאת הגוף ואימות הטוקן לוקחים זמן),
+    // ואז אירוע הסגירה כבר חלף. מצב הזרם הוא העדות, לא רק האירוע.
+    let closed = response.destroyed === true || response.writable === false;
+    const beat = setInterval(() => {
+      if (closed || response.writableEnded || !response.writable) return;
+      try { response.write(" "); } catch (error) { closed = true; }
+    }, 10_000);
+    const stop = () => { closed = true; clearInterval(beat); };
+    request.on("close", stop);
+    response.on("close", stop);
+    job.promise.then(payload => {
+      const live = !closed && response.writable !== false;
+      stop();
+      if (live && !response.writableEnded) {
+        try { response.end(JSON.stringify(payload)); } catch (error) {}
+      }
+    }, () => stop());
+    return beat;
+  }
+
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1171,6 +1244,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
     const origin = typeof request.headers.origin === "string" ? request.headers.origin : "";
     const url = new URL(request.url || "/", "http://localhost");
     let scanHeartbeat = null; // v2: מוצהר כאן כדי שגם ה-catch החיצוני ינקה אותו
+    let scanJob = null;       // v13: העבודה שהבקשה הזאת פתחה, אם פתחה
 
     try {
       if (request.method === "OPTIONS") {
@@ -1199,6 +1273,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
           serviceTier: openaiServiceTier,
           fastMode: openaiServiceTier === "priority",
           photoFirst: true, scanAuditVersion: 1,
+          resumableScans: true, // v13: סריקה ששרדה נתק ניתנת לאיסוף עם אותו מפתח
           retryModel: openaiRetryModel || null,
           retryServiceTier: openaiRetryModel ? openaiRetryTier : null,
           keyConfigured: keyStatus === "ready",
@@ -1231,13 +1306,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
         return;
       }
 
-      // מגבלת קצב per-instance, כמו ביטבתה: הגנה על התקציב, לא אבטחה.
       const clientIp = getClientIp(request);
-      if (!enforceRateLimit(`uid:${uid}`, 30) || !enforceRateLimit(`ip:${clientIp}`, 40)) {
-        writeJson(response, origin, 429, { ok: false, error: "rate_limited", retryAfterMinutes: 10 });
-        return;
-      }
-
       const contentLength = Number(request.headers["content-length"] || 0);
       if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
         request.resume();
@@ -1253,6 +1322,32 @@ function decodeAnalyzeClaims(result, aliasToId) {
           ok: false,
           error: error && error.code === "request_too_large" ? "request_too_large" : "invalid_json",
         });
+        return;
+      }
+
+      // ===== v13: הסריקה שורדת את הקו =====
+      // קריאה כפולה + הסלמה לוקחת דקה וחצי עד שתיים, וטלפון בחנות לא תמיד מחזיק
+      // חיבור כל כך הרבה זמן: נעילת מסך, מעבר בין אנטנות או יציאה מהאפליקציה
+      // חותכים את התשובה באמצע. עד כאן זה איבד סריקה שלמה ששולמה במלואה —
+      // הלקוח קיבל גוף קטוע בלי קוד ובלי יומן. מעכשיו כל סריקה היא "עבודה" עם
+      // מפתח שהלקוח מגריל: העבודה ממשיכה גם כשהחיבור מת, והלקוח חוזר עם אותו
+      // מפתח ואוסף את התוצאה — בלי לצלם שוב ובלי לשלם שוב.
+      const scanKey = scanJobKey(body && body.scanKey);
+      const resumeRequested = !!(body && body.resume === true);
+      if (resumeRequested) {
+        const job = scanKey ? scanJobs.get(scanJobId(uid, scanKey)) : null;
+        if (!job) {
+          writeJson(response, origin, 200, { ok: false, error: "resume_unknown", serviceVersion: SERVICE_VERSION });
+          return;
+        }
+        scanHeartbeat = streamScanJob(job, request, response, origin);
+        return;
+      }
+
+      // מגבלת קצב per-instance, כמו ביטבתה: הגנה על התקציב, לא אבטחה. חיבור
+      // שנפל וחוזר עם אותו מפתח אינו סריקה חדשה, ולכן אינו נספר כאן.
+      if (!enforceRateLimit(`uid:${uid}`, 30) || !enforceRateLimit(`ip:${clientIp}`, 40)) {
+        writeJson(response, origin, 429, { ok: false, error: "rate_limited", retryAfterMinutes: 10 });
         return;
       }
 
@@ -1518,21 +1613,25 @@ function decodeAnalyzeClaims(result, aliasToId) {
       // מוכנה. רווחים לבנים הם קידומת JSON חוקית — הלקוח מנתח כרגיל.
       // מרגע זה גם שגיאות חוזרות כגוף JSON עם ok:false בסטטוס 200; הלקוח
       // ממילא מנתב לפי payload.ok וקוד השגיאה, לא לפי הסטטוס.
-      response.writeHead(200, Object.assign({
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store",
-      }, corsHeaders(origin)));
-      scanHeartbeat = setInterval(() => { try { response.write(" "); } catch (error) {} }, 10_000);
+      // v13: הפעימות שייכות לחיבור, לא לסריקה. אותה בקשה בדיוק (אותו מפתח)
+      // אינה מתחילה קריאה שנייה למודל — היא נצמדת לעבודה שכבר רצה.
+      const existingJob = scanKey ? scanJobs.get(scanJobId(uid, scanKey)) : null;
+      if (existingJob) {
+        request.resume();
+        scanHeartbeat = streamScanJob(existingJob, request, response, origin);
+        return;
+      }
+      scanJob = createScanJob(scanKey ? scanJobId(uid, scanKey) : null);
+      scanHeartbeat = streamScanJob(scanJob, request, response, origin);
       const scanAudit = { version: 1, id: crypto.randomUUID(), startedAt: now(), attempts: [] };
       const finishScan = (value) => {
         scanAudit.completedAt = now();
         scanAudit.result = !value.ok ? (value.error || 'failed') : value.paperValidation
           ? (value.paperValidation.every(check => check.receivable) ? 'paper_verified' : 'paper_needs_review') : 'completed';
         value.scanAudit = scanAudit;
+        value.scanKey = scanKey; // כדי שהלקוח יידע בוודאות באיזה מפתח לחזור
         logger.info?.('invoice_scan_audit', scanAudit);
-        clearInterval(scanHeartbeat);
-        scanHeartbeat = null;
-        try { response.end(JSON.stringify(value)); } catch (error) {}
+        settleScanJob(scanJob, value);
       };
 
       // אין קטלוג ואין רמזים: הקוד המודפס הוא הזהות, וההתאמה נעשית בלקוח.
@@ -1802,7 +1901,11 @@ function decodeAnalyzeClaims(result, aliasToId) {
     } catch (error) {
       logger.error("Unhandled scanner error", error);
       if (scanHeartbeat) clearInterval(scanHeartbeat);
-      if (!response.headersSent) {
+      // v13: כשקיימת עבודה — היא זאת שנסגרת, וכל חיבור שנצמד אליה (גם כזה
+      // שיחזור בעוד רגע עם אותו מפתח) יקבל את אותה תשובה במקום לתלות.
+      if (scanJob && !scanJob.settled) {
+        settleScanJob(scanJob, { ok: false, error: "internal_error", serviceVersion: SERVICE_VERSION });
+      } else if (!response.headersSent) {
         writeJson(response, origin, 500, { ok: false, error: "internal_error" });
       } else {
         try { response.end(JSON.stringify({ ok: false, error: "internal_error" })); } catch (e) {}

@@ -1,4 +1,17 @@
-# Tnuva invoice scanner — service 12
+# Tnuva invoice scanner — service 13
+
+A scan outlives the connection that asked for it. Two parallel reads plus an
+escalation take a minute and a half to two minutes, and a phone in a store does
+not always hold a connection that long: a locked screen, a change of antenna or
+a switch to another app cuts the answer in the middle. Until service 12 that
+threw away a whole scan that had already been read and paid for, and the client
+saw a truncated body with no error code and no audit. Now every scan is a job
+under a key the client picks: the work continues without the connection, and a
+client that reconnects with `{scanKey, resume: true}` collects the finished
+result — no new photographs and no second payment. A key this instance never
+saw answers `resume_unknown`, which tells the client to send the photos again.
+Jobs are kept in memory for half an hour after they finish, an hour at most.
+A request with no key behaves exactly as before.
 
 Every scan is read twice in parallel by the base model. The two reads are
 compared on row code, quantity, unit price, line total, promotion star and
@@ -49,10 +62,10 @@ unchanged.
 fixture Firebase signatures and mocked model responses. No paid requests.
 
 Deploy this source to the existing `tnuva-ai-scan` service first. `/health`
-must report `serviceVersion:12`, `photoFirst:true`, `scanAuditVersion:1`,
-`keyStatus:"ready"`, and `retryModel:"gpt-5.6-terra"` — without a retry model
-the escalation runs on the base model and buys nothing. Preserve the verified
-runtime configuration:
+must report `serviceVersion:13`, `resumableScans:true`, `photoFirst:true`,
+`scanAuditVersion:1`, `keyStatus:"ready"`, and `retryModel:"gpt-5.6-terra"` —
+without a retry model the escalation runs on the base model and buys nothing.
+Preserve the verified runtime configuration:
 
 - `OPENAI_MODEL=gpt-5.6-luna`
 - `OPENAI_RETRY_MODEL=gpt-5.6-terra`
