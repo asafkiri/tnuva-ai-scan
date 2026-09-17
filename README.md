@@ -1,4 +1,4 @@
-# Tnuva invoice scanner — service 11
+# Tnuva invoice scanner — service 12
 
 Every scan is read twice in parallel by the base model. The two reads are
 compared on row code, quantity, unit price, line total, promotion star and
@@ -11,6 +11,12 @@ that read wins. Rows the reads disagreed on are returned in
 `consensus.disputedRows` and raise a warning, because a paper whose money
 closes perfectly can still carry an identity read from the wrong row.
 `OPENAI_CONSENSUS_READS=1` restores the single-read behaviour.
+
+A call that never reached the model is not an answer: a read that fails with a
+network error inside the first minute is retried once, because a fast failure
+is a dropped connection rather than a slow read, and because the retry then
+still fits inside the client's waiting window. A failure after the model
+actually read is never retried.
 
 Photo-first requests omit typed subtotal/line anchors. The server verifies
 each paper against its own printed net subtotal and item-line count. It uses
@@ -43,7 +49,7 @@ unchanged.
 fixture Firebase signatures and mocked model responses. No paid requests.
 
 Deploy this source to the existing `tnuva-ai-scan` service first. `/health`
-must report `serviceVersion:11`, `photoFirst:true`, `scanAuditVersion:1`,
+must report `serviceVersion:12`, `photoFirst:true`, `scanAuditVersion:1`,
 `keyStatus:"ready"`, and `retryModel:"gpt-5.6-terra"` — without a retry model
 the escalation runs on the base model and buys nothing. Preserve the verified
 runtime configuration:

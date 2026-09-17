@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
-import { tnuvaPaperCheck, scanChecksumMismatches, scanConsensusDiff, scanConsensusDisputedRows, createServer } from './server.js';
+import { tnuvaPaperCheck, scanChecksumMismatches, scanConsensusDiff, scanConsensusDisputedRows, OPENAI_NETWORK_RETRY_WINDOW_MS, createServer } from './server.js';
 
 const image = 'data:image/jpeg;base64,YQ==';
 const catalog = [{ id: 'milk', name: 'חלב בדיקה', barcode: '7290000000008' }];
@@ -213,9 +213,10 @@ test('reads that disagree escalate to Terra, and the expensive read wins', async
   assert.ok(output.scan.warnings.some(warning => warning.includes('אישור ידני')));
 });
 
-test('a read that failed is not a witness: the scan escalates without a second opinion', async () => {
-  const { output, calls } = await request([answer(doc()), new Error('test network failure'), answer(doc())]);
-  assert.equal(calls.length, 3);
+test('a read that keeps failing is not a witness: the scan escalates without a second opinion', async () => {
+  // הנפילה חוזרת גם בניסיון הנוסף, ולכן נשארת קריאה אחת בלבד.
+  const { output, calls } = await request([answer(doc()), new Error('test network failure'), new Error('test network failure'), answer(doc())]);
+  assert.equal(calls.length, 4);
   assert.equal(output.ok, true);
   assert.equal(output.consensus.reason, 'read_failed');
   assert.equal(output.consensus.completedReads, 1);
@@ -233,11 +234,29 @@ test('failed escalation keeps the cheap read and still raises the disputed row',
   assert.equal(output.consensus.disputedRows.length, 1);
 });
 
-test('both reads failing returns the failure, not a half answer', async () => {
-  const { output, calls } = await request([new Error('test network failure'), new Error('test network failure')]);
-  assert.equal(calls.length, 2);
+test('both reads failing, twice each, returns the failure and not a half answer', async () => {
+  const drop = () => new Error('test network failure');
+  const { output, calls } = await request([drop(), drop(), drop(), drop()]);
+  assert.equal(calls.length, 4);
   assert.equal(output.ok, false);
   assert.equal(output.error, 'openai_network_error');
+});
+
+// v12: נתק בדרך אל המודל אינו תשובה — הקריאה שנפלה מהר מנסה שוב פעם אחת.
+test('a read dropped on the way to the model is retried once, and the scan never sees it', async () => {
+  const { output, calls } = await request([answer(doc()), new Error('test network failure'), answer(doc())]);
+  assert.equal(calls.length, 3, 'two reads, one of them after a retry');
+  assert.equal(output.ok, true);
+  assert.equal(output.consensus.agreed, true, 'the retried read answered, so the two reads agree');
+  assert.equal(output.consensus.escalated, false, 'a dropped connection never costs an escalation');
+  assert.deepEqual(output.scanAudit.attempts.map(a => a.stage), ['consensus_1', 'consensus_2', 'consensus_2_retry']);
+  assert.equal(output.scanAudit.attempts[1].outcome, 'network_error_retried');
+});
+
+test('a read that fails slowly is not retried, because it was read and not dropped', () => {
+  // סף הניסיון החוזר הוא 60 שניות: נפילה מהירה היא נתק, נפילה איטית היא קריאה.
+  assert.equal(typeof OPENAI_NETWORK_RETRY_WINDOW_MS, 'number');
+  assert.equal(OPENAI_NETWORK_RETRY_WINDOW_MS, 60_000);
 });
 
 test('OPENAI_CONSENSUS_READS=1 restores the single cheap read', async () => {

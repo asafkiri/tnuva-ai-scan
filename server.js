@@ -57,9 +57,12 @@ const OPENAI_IMAGE_DETAIL = "original";
 const OPENAI_REASONING_EFFORT = "medium";
 const OPENAI_MAX_OUTPUT_TOKENS = 48_000;
 const OPENAI_TIMEOUT_MS = 180_000;
+// v12: נפילת רשת שקרתה בתוך החלון הזה נחשבת נתק וזוכה לניסיון נוסף אחד.
+// 60 שניות שומרות את המקרה הגרוע (60 + 180) בתוך חלון ההמתנה של הלקוח.
+export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 11; // Two parallel cheap reads, escalation on disagreement, disputed rows.
+const SERVICE_VERSION = 12; // Retry a dropped call to the model before failing the scan.
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -1603,7 +1606,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
           }
         } catch (error) {
           audit.outcome = error && error.name === "AbortError" ? "timeout" : "network_error";
-          return { fail: { status: error && error.name === "AbortError" ? 504 : 502, body: {
+          return { audit, fail: { status: error && error.name === "AbortError" ? 504 : 502, body: {
             ok: false,
             error: error && error.name === "AbortError" ? "openai_timeout" : "openai_network_error",
           } } };
@@ -1649,10 +1652,24 @@ function decodeAnalyzeClaims(result, aliasToId) {
         return { scan, data, openaiResponse, audit };
       };
 
+      // v12: נפילת רשת בדרך אל המודל אינה תשובה. ב-17.9 שתי הקריאות המקבילות
+      // נפלו יחד (11 ו-60 שניות, בלי requestId) והסריקה כולה נכשלה — אף שאף
+      // אחת מהן לא הספיקה להיקרא. קריאה שנפלה מהר מנסה שוב פעם אחת: "מהר"
+      // הוא הסימן שזה נתק ולא קריאה איטית, והוא גם מה ששומר את הזמן הכולל
+      // בתוך חלון ההמתנה של הלקוח. כישלון אחרי קריאה אמיתית אינו חוזר.
+      const readWithRetry = async (stage) => {
+        const first = await attemptScan(null, OPENAI_REASONING_EFFORT, false, stage);
+        if (!first.fail) return first;
+        const audit = first.audit || {};
+        const elapsed = Number(audit.completedAt) - Number(audit.startedAt);
+        if (audit.outcome !== 'network_error' || !Number.isFinite(elapsed) || elapsed >= OPENAI_NETWORK_RETRY_WINDOW_MS) return first;
+        audit.outcome = 'network_error_retried';
+        return attemptScan(null, OPENAI_REASONING_EFFORT, false, stage + '_retry');
+      };
       // v11: הקריאות הזולות יוצאות יחד. הראשונה שחוזרת אינה מנצחת — שתיהן
       // נשמרות, וההשוואה ביניהן היא שמחליטה אם צריך את המודל היקר.
       const reads = await Promise.all(Array.from({ length: consensusReads },
-        (unused, index) => attemptScan(null, OPENAI_REASONING_EFFORT, false, consensusReads > 1 ? 'consensus_' + (index + 1) : 'initial')));
+        (unused, index) => readWithRetry(consensusReads > 1 ? 'consensus_' + (index + 1) : 'initial')));
       const goodReads = reads.filter(read => !read.fail);
       if (!goodReads.length) {
         finishScan(reads[0].fail.body);
