@@ -339,3 +339,36 @@ test('a malformed key is ignored rather than trusted as an identity', () => {
   assert.equal(scanJobKey(null), null);
   assert.equal(scanJobId('uid', 'k'), 'uid|k');
 });
+
+// כישלון שמור אינו שווה איסוף: להחזיר אותו שוב ושוב נועל את התעודה על תקלה
+// חולפת. איסוף מחזיר סריקה שהצליחה; אחרת הלקוח שולח את הצילומים לקריאה חדשה.
+test('a saved failure is never replayed: the next attempt gets a real new read', async () => {
+  const drop = () => new Error('test network failure');
+  const { server, calls } = scanServer([drop(), drop(), drop(), drop(), ...agreed(doc())]);
+  const failed = await sendScan(server, { documents: input, catalog, scanKey: key }).ended;
+  assert.equal(failed.ok, false);
+  assert.equal(failed.error, 'openai_network_error');
+  assert.equal(calls.length, 4);
+  // איסוף של הכישלון הזה אומר "אינני מכיר", ולא מחזיר את הכישלון עצמו
+  const collected = await sendScan(server, { scanKey: key, resume: true }).ended;
+  assert.equal(collected.error, 'resume_unknown');
+  assert.equal(calls.length, 4, 'איסוף לעולם אינו קורא למודל');
+  // ואותו מפתח, עם הצילומים, מקבל קריאה חדשה לגמרי
+  const retried = await sendScan(server, { documents: input, catalog, scanKey: key }).ended;
+  assert.equal(retried.ok, true);
+  assert.equal(calls.length, 6, 'שתי קריאות חדשות, ולא תשובה שמורה');
+  server.close();
+});
+test('a full send never collects a stored result: photos mean read, resume means collect', async () => {
+  const { server, calls } = scanServer([...agreed(doc()), ...agreed(doc())]);
+  const first = await sendScan(server, { documents: input, catalog, scanKey: key }).ended;
+  assert.equal(first.ok, true);
+  assert.equal(calls.length, 2);
+  const again = await sendScan(server, { documents: input, catalog, scanKey: key }).ended;
+  assert.equal(again.ok, true);
+  assert.equal(calls.length, 4, 'הצילומים נקראו שוב, כי זאת בקשה לקרוא');
+  const collected = await sendScan(server, { scanKey: key, resume: true }).ended;
+  assert.equal(collected.ok, true);
+  assert.equal(calls.length, 4, 'והאיסוף מחזיר את מה שכבר נקרא, בלי לשלם');
+  server.close();
+});
