@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
-import { tnuvaPaperCheck, scanChecksumMismatches, scanConsensusDiff, scanConsensusDisputedRows, OPENAI_NETWORK_RETRY_WINDOW_MS, createServer } from './server.js';
+import { tnuvaPaperCheck, scanChecksumMismatches, scanConsensusDiff, scanConsensusDisputedRows, OPENAI_NETWORK_RETRY_WINDOW_MS, scanJobKey, scanJobId, createServer } from './server.js';
 
 const image = 'data:image/jpeg;base64,YQ==';
 const catalog = [{ id: 'milk', name: 'חלב בדיקה', barcode: '7290000000008' }];
@@ -63,7 +63,30 @@ const now = Math.floor(Date.now() / 1000);
 const unsigned = encode({ alg: 'RS256', kid: jwk.kid }) + '.' + encode({
   aud: 'tnuva-marketkiri-5d50d', iss: 'https://securetoken.google.com/tnuva-marketkiri-5d50d', sub: 'fixture', iat: now, exp: now + 3600 });
 const token = unsigned + '.' + crypto.sign('RSA-SHA256', Buffer.from(unsigned), privateKey).toString('base64url');
-async function request(responses, documents = input, extraEnv = {}) {
+// v13: תשובה מזויפת שמתנהגת כמו ServerResponse אמיתי — מאזינים, כתיבה, וניתוק
+// באמצע. בלי זה אי אפשר לבדוק את מה שקרה בחנות: הקו מת לפני שהתשובה נגמרה.
+function fakeResponse() {
+  const listeners = new Map();
+  return {
+    headersSent: false, writable: true, writableEnded: false, body: '', closed: false, resolveEnd: null,
+    on(event, handler) { listeners.set(event, [...(listeners.get(event) || []), handler]); return this; },
+    emit(event) { for (const handler of listeners.get(event) || []) handler(); },
+    writeHead() { this.headersSent = true; return this; },
+    write(chunk) { if (!this.writable) throw new Error('write after close'); this.body += chunk; return true; },
+    end(chunk) { if (chunk != null) this.body += chunk; this.writableEnded = true; this.resolveEnd?.(); },
+    drop() { this.writable = false; this.closed = true; this.emit('close'); }, // הקו מת
+    json() { return JSON.parse(this.body); },
+  };
+}
+function sendScan(server, body, { response = fakeResponse(), drain = true } = {}) {
+  const req = Readable.from([Buffer.from(JSON.stringify(body))]);
+  req.method = 'POST'; req.url = '/scan'; req.socket = { remoteAddress: '127.0.0.1' };
+  req.headers = { origin: 'https://asafkiri.github.io', authorization: 'Bearer ' + token };
+  const ended = new Promise(resolve => { response.resolveEnd = resolve; });
+  server.emit('request', req, response);
+  return { response, ended: drain ? ended.then(() => response.json()) : ended };
+}
+function scanServer(responses, extraEnv = {}) {
   const calls = [], logs = [];
   const server = createServer({ env: { OPENAI_API_KEY: 'fixture-only', OPENAI_MODEL: 'gpt-5.6-luna',
     OPENAI_RETRY_MODEL: 'gpt-5.6-terra', OPENAI_RETRY_SERVICE_TIER: 'priority', ...extraEnv },
@@ -78,12 +101,11 @@ async function request(responses, documents = input, extraEnv = {}) {
       return Response.json({ ...next, model: call.model, id: 'test-' + calls.length,
         usage: { input_tokens: 10, output_tokens: 20 } });
     } });
-  const output = await new Promise(resolve => {
-    const req = Readable.from([Buffer.from(JSON.stringify({ documents, catalog }))]);
-    req.method = 'POST'; req.url = '/scan'; req.socket = { remoteAddress: '127.0.0.1' };
-    req.headers = { origin: 'https://asafkiri.github.io', authorization: 'Bearer ' + token };
-    server.emit('request', req, { headersSent: false, writeHead() { this.headersSent = true; }, write() {}, end(body) { resolve(JSON.parse(body)); } });
-  });
+  return { server, calls, logs };
+}
+async function request(responses, documents = input, extraEnv = {}) {
+  const { server, calls, logs } = scanServer(responses, extraEnv);
+  const output = await sendScan(server, { documents, catalog }).ended;
   server.close();
   return { output, calls, logs };
 }
@@ -265,4 +287,55 @@ test('OPENAI_CONSENSUS_READS=1 restores the single cheap read', async () => {
   assert.equal(output.ok, true);
   assert.equal(output.consensus.attempted, false);
   assert.equal(output.scanAudit.attempts[0].stage, 'initial');
+});
+
+// ===== v13: הסריקה שורדת את הקו =====
+// זה הכשל שחזר בחנות ב-17.9: קריאה כפולה + הסלמה נמשכת דקה וחצי עד שתיים,
+// הטלפון מאבד את החיבור באמצע, והלקוח קיבל גוף קטוע בלי קוד ובלי יומן —
+// כלומר סריקה שלמה ששולמה במלואה נזרקה לפח, והמשתמש צילם הכול מחדש.
+const key = 'scan-key-1234';
+test('a connection that dies mid-scan does not lose the scan: the same key collects it', async () => {
+  const { server, calls } = scanServer(agreed(doc()));
+  const first = sendScan(server, { documents: input, catalog, scanKey: key }, { drain: false });
+  first.response.drop(); // הטלפון איבד את הקו בזמן שהמודל עוד קורא
+  const resumed = await sendScan(server, { scanKey: key, resume: true }).ended;
+  assert.equal(calls.length, 2, 'the paid reads happened once, not twice');
+  assert.equal(resumed.ok, true);
+  assert.equal(resumed.scanKey, key);
+  assert.equal(resumed.scan.documents[0].subtotalExVat, 50);
+  assert.ok(resumed.scanAudit, 'the audit comes back with it, so a failure stays diagnosable');
+  assert.equal(first.response.writableEnded, false, 'nothing was written to the dead connection');
+  server.close();
+});
+test('the same key sent again joins the running scan instead of paying for a second one', async () => {
+  const { server, calls } = scanServer(agreed(doc()));
+  const first = sendScan(server, { documents: input, catalog, scanKey: key });
+  const second = sendScan(server, { documents: input, catalog, scanKey: key });
+  const [a, b] = await Promise.all([first.ended, second.ended]);
+  assert.equal(calls.length, 2, 'two reads for one scan — not four');
+  assert.deepEqual(a, b);
+  server.close();
+});
+test('a key the instance never saw says so, so the client knows to send the photos again', async () => {
+  const { server, calls } = scanServer([]);
+  const output = await sendScan(server, { scanKey: 'no-such-key-01', resume: true }).ended;
+  assert.equal(output.ok, false);
+  assert.equal(output.error, 'resume_unknown');
+  assert.equal(output.serviceVersion, 13);
+  assert.equal(calls.length, 0);
+  server.close();
+});
+test('a scan with no key behaves exactly as before, and nothing is kept', async () => {
+  const { output, calls } = await request(agreed(doc()));
+  assert.equal(output.ok, true);
+  assert.equal(output.scanKey, null);
+  assert.equal(calls.length, 2);
+});
+test('a malformed key is ignored rather than trusted as an identity', () => {
+  assert.equal(scanJobKey('scan-key-1234'), 'scan-key-1234');
+  assert.equal(scanJobKey('short'), null);
+  assert.equal(scanJobKey('has spaces in it'), null);
+  assert.equal(scanJobKey('a'.repeat(65)), null);
+  assert.equal(scanJobKey(null), null);
+  assert.equal(scanJobId('uid', 'k'), 'uid|k');
 });
