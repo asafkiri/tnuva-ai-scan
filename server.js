@@ -907,10 +907,18 @@ export function createServer({
       const finished = job.settled && nowMs - job.settledAt > SCAN_JOB_TTL_MS;
       if (finished || age > SCAN_JOB_MAX_AGE_MS) scanJobs.delete(id);
     }
+    // פינוי מפנה רק עבודות שהסתיימו. עבודה שעוד רצה היא סריקה ששולמה ועדיין
+    // נקראת; לפנות אותה פירושו להשיב resume_unknown על סריקה חיה ולשלוח את
+    // המשתמש לצלם הכול מחדש — בדיוק מה שהמנגנון הזה בא למנוע.
     while (scanJobs.size >= SCAN_JOB_LIMIT) {
-      const oldest = scanJobs.keys().next();
-      if (oldest.done) break;
-      scanJobs.delete(oldest.value);
+      let evicted = false;
+      for (const [id, job] of scanJobs) {
+        if (!job.settled) continue;
+        scanJobs.delete(id);
+        evicted = true;
+        break;
+      }
+      if (!evicted) break;
     }
   }
   function createScanJob(id) {
@@ -1335,8 +1343,14 @@ function decodeAnalyzeClaims(result, aliasToId) {
       const scanKey = scanJobKey(body && body.scanKey);
       const resumeRequested = !!(body && body.resume === true);
       if (resumeRequested) {
-        const job = scanKey ? scanJobs.get(scanJobId(uid, scanKey)) : null;
-        if (!job) {
+        const id = scanKey ? scanJobId(uid, scanKey) : null;
+        const job = id ? scanJobs.get(id) : null;
+        // איסוף מחזיר סריקה שהצליחה. כישלון שמור אינו שווה איסוף: להחזיר אותו
+        // שוב ושוב פירושו לנעול את התעודה על תקלה חולפת (נתק אל המודל שכבר
+        // חלף), ולכן הוא נמחק והלקוח שולח את הצילומים לקריאה חדשה.
+        const worthless = job && job.settled && !(job.payload && job.payload.ok);
+        if (worthless) scanJobs.delete(id);
+        if (!job || worthless) {
           writeJson(response, origin, 200, { ok: false, error: "resume_unknown", serviceVersion: SERVICE_VERSION });
           return;
         }
@@ -1615,10 +1629,13 @@ function decodeAnalyzeClaims(result, aliasToId) {
       // ממילא מנתב לפי payload.ok וקוד השגיאה, לא לפי הסטטוס.
       // v13: הפעימות שייכות לחיבור, לא לסריקה. אותה בקשה בדיוק (אותו מפתח)
       // אינה מתחילה קריאה שנייה למודל — היא נצמדת לעבודה שכבר רצה.
-      const existingJob = scanKey ? scanJobs.get(scanJobId(uid, scanKey)) : null;
-      if (existingJob) {
+      // בקשה מלאה נצמדת רק לעבודה שעוד רצה (אותה בקשה שנשלחה פעמיים), ואינה
+      // מקבלת תוצאה שמורה: מי ששולח צילומים מבקש קריאה, ומי שמבקש לאסוף שולח
+      // resume. כך תוצאה שמורה לעולם אינה "נדבקת" לסריקה חדשה.
+      const running = scanKey ? scanJobs.get(scanJobId(uid, scanKey)) : null;
+      if (running && !running.settled) {
         request.resume();
-        scanHeartbeat = streamScanJob(existingJob, request, response, origin);
+        scanHeartbeat = streamScanJob(running, request, response, origin);
         return;
       }
       scanJob = createScanJob(scanKey ? scanJobId(uid, scanKey) : null);
