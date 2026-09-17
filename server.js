@@ -62,7 +62,7 @@ const OPENAI_TIMEOUT_MS = 180_000;
 export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 13; // The scan outlives the connection: reconnect with the same key.
+const SERVICE_VERSION = 14; // Rows are compared by content, and a row two reads agree on is not disputed.
 // v13: עבודת סריקה נשמרת חצי שעה אחרי שהסתיימה, ושעה לכל היותר מרגע שנפתחה.
 // זה מכסה בנוחות טלפון שנפל וחוזר, ואינו מחזיק זיכרון מעבר לכך.
 const SCAN_JOB_TTL_MS = 30 * 60 * 1000;
@@ -520,68 +520,175 @@ function consensusDisplay(field, value) {
   if (CONSENSUS_MONEY_FIELDS.has(field)) return Number.isFinite(Number(value)) ? `₪${Number(value).toFixed(2)}` : "לא נקרא";
   return String(value).trim() || "לא נקרא";
 }
-// כל ההבדלים בין שתי קריאות של אותו צילום, לפי מיקום השורה בטבלה.
-export function scanConsensusDiff(first, second) {
+// ===== v14: השורות מושוות לפי תוכנן, לא לפי מיקומן =====
+// עד שירות 13 שורה i של קריאה אחת הושוותה לשורה i של הקריאה השנייה, ומסמך
+// שמספר שורותיו נחלק בין הקריאות הוכרז "במחלוקת כולו". ב-17.9 קריאה אחת
+// ראתה 29 שורות בנייר של 28 — וכל 28 השורות עלו לאישור ידני, אף שהקריאה
+// שנבחרה נסגרה מול הסיכום המודפס עד האגורה. שורה שפוצלה, הוכפלה או הושמטה
+// מזיזה את כל מה שאחריה במיקום, אבל לא בתוכן: הקוד, הכמות, המחיר והסכום של
+// שורה אמיתית חוזרים באותה צורה בשתי הקריאות. לכן היישור נעשה לפי דמיון
+// התוכן ושומר על סדר הטבלה, ורק שורה שאין לה בת-זוג — או שבת-הזוג שלה שונה
+// בשדה שנספר — היא הבדל.
+const CONSENSUS_ALIGN_WEIGHTS = { code: 3, lineTotalExVat: 2, unitPriceExVat: 1, quantity: 1, promoStar: .25, section: .25, sourcePage: .25 };
+const CONSENSUS_ALIGN_MIN = 2; // אותו קוד, או אותו סכום שורה, או אותה כמות עם אותו מחיר
+const CONSENSUS_ALIGN_MAX_ROWS = 400;
+function consensusRowSimilarity(rowA, rowB) {
+  let score = 0;
+  for (const field of CONSENSUS_ROW_FIELDS) {
+    const a = consensusValue(field, rowA[field]);
+    if (a !== null && a === consensusValue(field, rowB[field])) score += CONSENSUS_ALIGN_WEIGHTS[field] || 0;
+  }
+  return score;
+}
+// זוגות שורות בין שתי קריאות: {a, b} עם מיקום בכל קריאה, או null בצד שלא
+// ראה את השורה. יישור רצפים שמרבה את סך הדמיון, בלי לחצות סדר; שורות
+// שנותרו בלי זוג בין שני עוגנים, במספר שווה משני הצדדים, מזווגות לפי מיקום —
+// כך שקריאות עם אותו מספר שורות מושוות בדיוק כמו קודם, שדה מול שדה.
+export function alignConsensusRows(rowsA, rowsB) {
+  const n = Math.min(rowsA.length, CONSENSUS_ALIGN_MAX_ROWS), m = Math.min(rowsB.length, CONSENSUS_ALIGN_MAX_ROWS);
+  const similarity = Array.from({ length: n }, (unused, i) => Array.from({ length: m }, (unusedToo, j) => {
+    const score = consensusRowSimilarity(rowsA[i] || {}, rowsB[j] || {});
+    return score >= CONSENSUS_ALIGN_MIN ? score : 0;
+  }));
+  const best = Array.from({ length: n + 1 }, () => new Float64Array(m + 1));
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      let score = Math.max(best[i + 1][j], best[i][j + 1]);
+      if (similarity[i][j] > 0) score = Math.max(score, similarity[i][j] + best[i + 1][j + 1]);
+      best[i][j] = score;
+    }
+  }
+  const pairs = [];
+  let i = 0, j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && similarity[i][j] > 0 && best[i][j] === similarity[i][j] + best[i + 1][j + 1]) { pairs.push({ a: i, b: j }); i += 1; j += 1; }
+    else if (i < n && (j >= m || best[i][j] === best[i + 1][j])) { pairs.push({ a: i, b: null }); i += 1; }
+    else { pairs.push({ a: null, b: j }); j += 1; }
+  }
+  for (let index = CONSENSUS_ALIGN_MAX_ROWS; index < Math.max(rowsA.length, rowsB.length); index += 1) {
+    pairs.push({ a: index < rowsA.length ? index : null, b: index < rowsB.length ? index : null });
+  }
   const out = [];
-  const push = entry => { if (out.length < MAX_CONSENSUS_DIFFS) out.push(entry); };
+  let loneA = [], loneB = [];
+  const flush = () => {
+    if (loneA.length && loneA.length === loneB.length) loneA.forEach((a, index) => out.push({ a, b: loneB[index] }));
+    else { loneA.forEach(a => out.push({ a, b: null })); loneB.forEach(b => out.push({ a: null, b })); }
+    loneA = []; loneB = [];
+  };
+  for (const pair of pairs) {
+    if (pair.a !== null && pair.b !== null) { flush(); out.push(pair); }
+    else if (pair.a !== null) loneA.push(pair.a);
+    else loneB.push(pair.b);
+  }
+  flush();
+  return out;
+}
+// כל ההבדלים בין שתי קריאות של אותו צילום. rowIndex הוא מיקום השורה בקריאה
+// הראשונה (זו שנבחרה, כשמשווים מולה), otherRowIndex — בשנייה; שורה שרק צד
+// אחד ראה מקבלת null בצד השני והבדל בשדה "row".
+function consensusDiffAll(first, second) {
+  const out = [];
   const docsA = (first && first.documents) || [], docsB = (second && second.documents) || [];
   const noteIndexes = [...new Set([...docsA, ...docsB].map(doc => Number(doc && doc.noteIndex)))].sort((a, b) => a - b);
   for (const noteIndex of noteIndexes) {
     const a = docsA.find(doc => Number(doc && doc.noteIndex) === noteIndex);
     const b = docsB.find(doc => Number(doc && doc.noteIndex) === noteIndex);
-    if (!a || !b) { push({ noteIndex, scope: "document", field: "document", values: [a ? "נקרא" : null, b ? "נקרא" : null] }); continue; }
+    if (!a || !b) { out.push({ noteIndex, scope: "document", field: "document", values: [a ? "נקרא" : null, b ? "נקרא" : null] }); continue; }
     for (const field of CONSENSUS_DOC_FIELDS) {
       if (consensusValue(field, a[field]) !== consensusValue(field, b[field])) {
-        push({ noteIndex, scope: "document", field, values: [a[field] ?? null, b[field] ?? null] });
+        out.push({ noteIndex, scope: "document", field, values: [a[field] ?? null, b[field] ?? null] });
       }
     }
     const rowsA = Array.isArray(a.rows) ? a.rows : [], rowsB = Array.isArray(b.rows) ? b.rows : [];
-    if (rowsA.length !== rowsB.length) push({ noteIndex, scope: "document", field: "rowCount", values: [rowsA.length, rowsB.length] });
-    for (let index = 0; index < Math.max(rowsA.length, rowsB.length); index += 1) {
-      const rowA = rowsA[index], rowB = rowsB[index];
-      const lineNumber = Number((rowA || rowB || {}).lineNumber) || index + 1;
-      if (!rowA || !rowB) { push({ noteIndex, scope: "row", rowIndex: index, lineNumber, field: "row", values: [rowA ? "נקראה" : null, rowB ? "נקראה" : null] }); continue; }
+    if (rowsA.length !== rowsB.length) out.push({ noteIndex, scope: "document", field: "rowCount", values: [rowsA.length, rowsB.length] });
+    for (const pair of alignConsensusRows(rowsA, rowsB)) {
+      const rowA = pair.a === null ? null : rowsA[pair.a], rowB = pair.b === null ? null : rowsB[pair.b];
+      if (!rowA || !rowB) {
+        const row = rowA || rowB || {}, index = rowA ? pair.a : pair.b;
+        out.push({ noteIndex, scope: "row", rowIndex: pair.a, otherRowIndex: pair.b, lineNumber: Number(row.lineNumber) || index + 1, field: "row",
+          code: row.code ?? null, description: String(row.description || "").slice(0, 80),
+          values: [rowA ? "נקראה" : null, rowB ? "נקראה" : null] });
+        continue;
+      }
+      const lineNumber = Number(rowA.lineNumber) || pair.a + 1;
       for (const field of CONSENSUS_ROW_FIELDS) {
         if (consensusValue(field, rowA[field]) !== consensusValue(field, rowB[field])) {
-          push({ noteIndex, scope: "row", rowIndex: index, lineNumber, field, values: [rowA[field] ?? null, rowB[field] ?? null] });
+          out.push({ noteIndex, scope: "row", rowIndex: pair.a, otherRowIndex: pair.b, lineNumber, field, values: [rowA[field] ?? null, rowB[field] ?? null] });
         }
       }
     }
   }
   return out;
 }
-// השורות שהקריאות נחלקו עליהן, ביחס לקריאה שנבחרה — זה מה שהלקוח מעלה
-// לאישור ידני. מסמך שמספר שורותיו שונה בין הקריאות שנוי במחלוקת כולו, כי
-// מהשורה שבה נוספה או נעלמה שורה ואילך אי אפשר להשוות שורה לשורה.
-export function scanConsensusDisputedRows(selected, others) {
-  const disputed = new Map();
+export function scanConsensusDiff(first, second) {
+  return consensusDiffAll(first, second).slice(0, MAX_CONSENSUS_DIFFS);
+}
+// השורות שנותרו במחלוקת ביחס לקריאה שנבחרה — זה מה שהלקוח מעלה לאישור ידני.
+// שדה בשורה שנוי במחלוקת רק כשקריאה אחרת קראה אותו אחרת ואף קריאה אחרת אינה
+// מאשרת את הערך שנבחר: שתיים מתוך שלוש קריאות שמסכימות — המודל היקר ואחת
+// הזולות — הכריעו, וההכרעה אינה נשאלת שוב. כשיש רק קריאה אחת מולה כל הבדל
+// נשאר במחלוקת, כי אין דעה שלישית. שורה שרק הקריאה שנבחרה ראתה עולה כמחלוקת
+// על עצם קיומה (שדה "row") — אלא אם הנייר עצמו מאשר אותה: מסמך שמספר שורותיו
+// שווה למונה "פריטים" המודפס וסכומיו נסגרים עד האגורה אינו יכול להכיל שורה
+// מומצאת, ולכן שורה שקריאה אחרת פספסה בו אינה שאלה למשתמש.
+export function scanConsensusDisputedRows(selected, others, options = {}) {
+  const paperConfirmsRows = typeof options.paperConfirmsRows === "function" ? options.paperConfirmsRows : () => false;
+  const docs = (selected && selected.documents) || [];
+  const ballots = new Map();
+  const ballot = (noteIndex, rowIndex, field) => {
+    const key = noteIndex + ":" + rowIndex + ":" + field;
+    if (!ballots.has(key)) ballots.set(key, { noteIndex, rowIndex, field, differing: [], confirmed: 0 });
+    return ballots.get(key);
+  };
   for (const other of (others || []).filter(Boolean)) {
-    for (const diff of scanConsensusDiff(selected, other)) {
-      if (diff.scope === "document" && diff.field !== "rowCount") continue;
-      const doc = ((selected && selected.documents) || []).find(item => Number(item && item.noteIndex) === diff.noteIndex);
+    const diffs = new Map();
+    for (const diff of consensusDiffAll(selected, other)) {
+      if (diff.scope === "row" && diff.rowIndex !== null) diffs.set(diff.noteIndex + ":" + diff.rowIndex + ":" + diff.field, diff);
+    }
+    const otherDocs = (other && other.documents) || [];
+    for (const doc of docs) {
+      const noteIndex = Number(doc && doc.noteIndex);
       const rows = doc && Array.isArray(doc.rows) ? doc.rows : [];
-      const targets = diff.field === "rowCount" ? rows.map((row, index) => index) : [diff.rowIndex];
-      for (const rowIndex of targets) {
-        if (!rows[rowIndex]) continue;
-        const key = diff.noteIndex + ":" + rowIndex;
-        if (!disputed.has(key)) {
-          disputed.set(key, { noteIndex: diff.noteIndex, rowIndex, lineNumber: Number(rows[rowIndex].lineNumber) || rowIndex + 1,
-            code: rows[rowIndex].code ?? null, description: String(rows[rowIndex].description || "").slice(0, 80), fields: [] });
+      const otherDoc = otherDocs.find(item => Number(item && item.noteIndex) === noteIndex);
+      rows.forEach((row, rowIndex) => {
+        const presence = ballot(noteIndex, rowIndex, "row");
+        if (!otherDoc || diffs.has(noteIndex + ":" + rowIndex + ":row")) { presence.differing.push(null); return; }
+        presence.confirmed += 1;
+        for (const field of CONSENSUS_ROW_FIELDS) {
+          const vote = ballot(noteIndex, rowIndex, field);
+          const diff = diffs.get(noteIndex + ":" + rowIndex + ":" + field);
+          if (diff) vote.differing.push(diff.values[1] ?? null); else vote.confirmed += 1;
         }
-        const entry = disputed.get(key);
-        const field = diff.field === "rowCount" ? "rowCount" : diff.field;
-        if (entry.fields.length < 8 && !entry.fields.some(item => item.field === field)) {
-          entry.fields.push({ field, selected: diff.field === "rowCount" ? rows.length : (rows[rowIndex][field] ?? null), other: diff.values[1] ?? null });
-        }
-      }
+      });
+    }
+  }
+  const disputed = new Map();
+  for (const vote of ballots.values()) {
+    if (!vote.differing.length || vote.confirmed > 0) continue;
+    if (vote.field === "row" && paperConfirmsRows(vote.noteIndex) === true) continue;
+    const doc = docs.find(item => Number(item && item.noteIndex) === vote.noteIndex);
+    const row = doc && Array.isArray(doc.rows) ? doc.rows[vote.rowIndex] : null;
+    if (!row) continue;
+    const key = vote.noteIndex + ":" + vote.rowIndex;
+    if (!disputed.has(key)) {
+      disputed.set(key, { noteIndex: vote.noteIndex, rowIndex: vote.rowIndex, lineNumber: Number(row.lineNumber) || vote.rowIndex + 1,
+        code: row.code ?? null, description: String(row.description || "").slice(0, 80), fields: [] });
+    }
+    const entry = disputed.get(key);
+    if (entry.fields.length < 8 && !entry.fields.some(item => item.field === vote.field)) {
+      entry.fields.push({ field: vote.field, selected: vote.field === "row" ? "נקראה" : (row[vote.field] ?? null),
+        other: vote.field === "row" ? null : (vote.differing[0] ?? null) });
     }
   }
   return [...disputed.values()].sort((a, b) => a.noteIndex - b.noteIndex || a.rowIndex - b.rowIndex);
 }
 function consensusCorrectiveText(diffs) {
+  const label = field => field === "rowCount" ? "מספר השורות" : field;
   const parts = (diffs || []).slice(0, MAX_CONSENSUS_CORRECTIVE_LINES).map(diff => diff.scope === "row"
-    ? `מסמך noteIndex=${diff.noteIndex}, שורה ${diff.lineNumber}: ${diff.field} נקרא פעם ${consensusDisplay(diff.field, diff.values[0])} ופעם ${consensusDisplay(diff.field, diff.values[1])}.`
-    : `מסמך noteIndex=${diff.noteIndex}: ${diff.field} נקרא פעם ${consensusDisplay(diff.field, diff.values[0])} ופעם ${consensusDisplay(diff.field, diff.values[1])}.`);
+    ? (diff.field === "row"
+      ? `מסמך noteIndex=${diff.noteIndex}, שורה ${diff.lineNumber}${diff.code ? ` (קוד ${diff.code})` : ""}: נקראה בקריאה אחת בלבד — ייתכן שפוצלה, הוכפלה, הומצאה או הושמטה.`
+      : `מסמך noteIndex=${diff.noteIndex}, שורה ${diff.lineNumber}: ${diff.field} נקרא פעם ${consensusDisplay(diff.field, diff.values[0])} ופעם ${consensusDisplay(diff.field, diff.values[1])}.`)
+    : `מסמך noteIndex=${diff.noteIndex}: ${label(diff.field)} נקרא פעם ${consensusDisplay(diff.field, diff.values[0])} ופעם ${consensusDisplay(diff.field, diff.values[1])}.`);
   return `שתי קריאות קודמות של אותו צילום נחלקו: ${parts.join(" ")}` +
     ` קרא את הנייר מחדש מההתחלה, ואל תבחר בין שתי הקריאות הקודמות — שתיהן עשויות לטעות.` +
     ` כשל ידוע בנייר הזה: עמודת הקוד נקראת בהסטה של שורה אחת, כך שקוד של שורה אחת נדבק לכמות ולמחיר של השורה שאחריה.` +
@@ -1893,9 +2000,12 @@ function decodeAnalyzeClaims(result, aliasToId) {
       }
 
       // השורות שבמחלוקת נמדדות מול הקריאה שנבחרה בפועל — גם אם קריאת ההצלה
-      // של סכום הביקורת החליפה אותה אחרי ההסלמה.
+      // של סכום הביקורת החליפה אותה אחרי ההסלמה. מסמך שנסגר מול הנייר (מונה
+      // הפריטים והסיכום המודפסים) מאשר בעצמו את מספר שורותיו.
       if (consensus.attempted && consensus.agreed === false) {
-        consensus.disputedRows = scanConsensusDisputedRows(scan, goodReads.map(read => read.scan).filter(value => value !== scan));
+        const paperOk = new Map(paperChecks(scan).map(check => [Number(check.noteIndex), check.ok === true]));
+        consensus.disputedRows = scanConsensusDisputedRows(scan, goodReads.map(read => read.scan).filter(value => value !== scan),
+          { paperConfirmsRows: noteIndex => paperOk.get(Number(noteIndex)) === true });
         for (const item of consensus.disputedRows) {
           const warning = `שתי הקריאות של הצילום נחלקו על שורה ${item.lineNumber} בתעודה ${item.noteIndex + 1}` +
             (item.description ? ` (${item.description})` : "") + ` — השורה דורשת אישור ידני לפני קליטה.`;

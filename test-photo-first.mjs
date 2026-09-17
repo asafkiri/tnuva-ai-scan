@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
-import { tnuvaPaperCheck, scanChecksumMismatches, scanConsensusDiff, scanConsensusDisputedRows, OPENAI_NETWORK_RETRY_WINDOW_MS, scanJobKey, scanJobId, createServer } from './server.js';
+import { tnuvaPaperCheck, scanChecksumMismatches, scanConsensusDiff, scanConsensusDisputedRows, alignConsensusRows, OPENAI_NETWORK_RETRY_WINDOW_MS, scanJobKey, scanJobId, createServer } from './server.js';
 
 const image = 'data:image/jpeg;base64,YQ==';
 const catalog = [{ id: 'milk', name: 'חלב בדיקה', barcode: '7290000000008' }];
@@ -199,7 +199,7 @@ test('identity drift that the money cannot see is caught by the second read', ()
   assert.deepEqual(scanConsensusDiff(scan(doc()), scan(doc())), []);
   const diffs = scanConsensusDiff(scan(shiftedCodes), scan(shiftedCodesOther));
   assert.equal(diffs.length, 1);
-  assert.deepEqual(diffs[0], { noteIndex: 0, scope: 'row', rowIndex: 1, lineNumber: 2, field: 'code', values: ['222', '111'] });
+  assert.deepEqual(diffs[0], { noteIndex: 0, scope: 'row', rowIndex: 1, otherRowIndex: 1, lineNumber: 2, field: 'code', values: ['222', '111'] });
   // התיאור והביטחון משתנים בין קריאות גם כשהנייר נקרא נכון — ולכן אינם הבדל.
   assert.deepEqual(scanConsensusDiff(scan(doc()), scan(doc({ confidence: .4, rows: [row({ description: 'חלב', confidence: .3 })] }))), []);
   assert.equal(scanConsensusDiff(scan(doc()), scan(doc({ rows: [row(), row({ lineNumber: 2 })] }))).some(d => d.field === 'rowCount'), true);
@@ -211,12 +211,90 @@ test('disputed rows are reported against the read that actually won', () => {
   assert.equal(disputed[0].rowIndex, 1);
   assert.equal(disputed[0].lineNumber, 2);
   assert.deepEqual(disputed[0].fields, [{ field: 'code', selected: '222', other: '111' }]);
-  // שורה שנוספה או נעלמה מזיזה את כל מה שאחריה, ולכן המסמך כולו במחלוקת.
-  assert.equal(scanConsensusDisputedRows(scan(shiftedCodes), [scan(doc())]).length, 2);
+  // קריאה שראתה שורה אחת בלבד: השורה הראשונה מזווגת לפי הכסף (קוד שונה),
+  // והשנייה נותרת בלי בת-זוג — שתי שורות במחלוקת, כל אחת מסיבתה שלה.
+  const short = scanConsensusDisputedRows(scan(shiftedCodes), [scan(doc())]);
+  assert.deepEqual(short.map(item => [item.rowIndex, item.fields.map(field => field.field)]), [[0, ['code']], [1, ['row']]]);
+  assert.deepEqual(short[1].fields, [{ field: 'row', selected: 'נקראה', other: null }]);
+});
+
+// ===== v14: השורות מושוות לפי תוכנן =====
+// 17.9, 16:07: קריאה אחת ראתה 29 שורות בנייר של 28 — וכל 28 השורות עלו לאישור
+// ידני עם "מספר שורות: 28 מול 29", אף שהקריאה שנבחרה נסגרה מול הנייר.
+const paper = rows => doc({ itemsPrintedLines: rows.length, rows,
+  subtotalExVat: Math.round(rows.reduce((sum, item) => sum + item.lineTotalExVat, 0) * 100) / 100 });
+const fourRows = () => [row({ code: '111', lineNumber: 1 }),
+  row({ code: '222', lineNumber: 2, quantity: 6, unitPriceExVat: 5, lineTotalExVat: 30 }),
+  row({ code: '333', lineNumber: 3, quantity: 2, unitPriceExVat: 4, lineTotalExVat: 8 }),
+  row({ code: '444', lineNumber: 4, quantity: 1, unitPriceExVat: 3, lineTotalExVat: 3 })];
+const fourRowPaper = paper(fourRows());
+// אותו נייר (אותו מונה מודפס, אותו סיכום), כשקריאה פיצלה את השורה השנייה
+// לשתיים: 29 מול 28 בזעיר אנפין.
+const splitRowPaper = doc({ ...fourRowPaper, rows: [fourRows()[0],
+  row({ code: '222', lineNumber: 2, quantity: 3, unitPriceExVat: 5, lineTotalExVat: 15 }),
+  row({ code: '222', lineNumber: 3, quantity: 3, unitPriceExVat: 5, lineTotalExVat: 15 }),
+  fourRows()[2], fourRows()[3]] });
+// אותו נייר, כשקריאה פספסה את השורה השלישית.
+const droppedRowPaper = doc({ ...fourRowPaper, rows: [fourRows()[0], fourRows()[1], fourRows()[3]] });
+
+test('rows are aligned by content, so an extra row in one read disturbs only itself', () => {
+  assert.deepEqual(alignConsensusRows(fourRowPaper.rows, splitRowPaper.rows),
+    [{ a: 0, b: 0 }, { a: 1, b: 1 }, { a: null, b: 2 }, { a: 2, b: 3 }, { a: 3, b: 4 }]);
+  assert.deepEqual(alignConsensusRows(fourRowPaper.rows, droppedRowPaper.rows),
+    [{ a: 0, b: 0 }, { a: 1, b: 1 }, { a: 2, b: null }, { a: 3, b: 2 }]);
+  // ההבדלים: מספר השורות, השורה שפוצלה (כמות וסכום), והחצי השני שאין לו זוג.
+  const diffs = scanConsensusDiff(scan(fourRowPaper), scan(splitRowPaper));
+  assert.deepEqual(diffs.map(diff => [diff.scope, diff.field, diff.rowIndex ?? null, diff.otherRowIndex ?? null]),
+    [['document', 'rowCount', null, null], ['row', 'quantity', 1, 1], ['row', 'lineTotalExVat', 1, 1], ['row', 'row', null, 2]]);
+  // רק השורה שפוצלה במחלוקת — לא 28 שורות, ובלי שדה "מספר שורות" על אף שורה.
+  const disputed = scanConsensusDisputedRows(scan(fourRowPaper), [scan(splitRowPaper)]);
+  assert.deepEqual(disputed.map(item => [item.rowIndex, item.fields.map(field => field.field)]), [[1, ['quantity', 'lineTotalExVat']]]);
+  assert.ok(!JSON.stringify(disputed).includes('rowCount'));
+  // שורה שהקריאה השנייה המציאה ואינה דומה לשום שורה אינה מחלוקת על שורות אמיתיות.
+  const invented = paper([...fourRows(), row({ code: '999', lineNumber: 5, quantity: 7, unitPriceExVat: 9, lineTotalExVat: 63 })]);
+  assert.deepEqual(scanConsensusDisputedRows(scan(fourRowPaper), [scan(invented)]), []);
+  // קריאות עם אותו מספר שורות עדיין מושוות שדה מול שדה, גם כששורה שונה בכולם.
+  const replaced = paper([fourRows()[0], fourRows()[1], row({ code: '777', lineNumber: 3, quantity: 5, unitPriceExVat: 7, lineTotalExVat: 35 }), fourRows()[3]]);
+  assert.deepEqual(scanConsensusDisputedRows(scan(fourRowPaper), [scan(replaced)]).map(item => [item.rowIndex, item.fields.map(field => field.field)]),
+    [[2, ['code', 'quantity', 'unitPriceExVat', 'lineTotalExVat']]]);
+});
+
+test('a row only the winning read saw is a question, unless the paper itself closes with it', () => {
+  const alone = scanConsensusDisputedRows(scan(fourRowPaper), [scan(droppedRowPaper)]);
+  assert.deepEqual(alone, [{ noteIndex: 0, rowIndex: 2, lineNumber: 3, code: '333', description: 'חלב בדיקה',
+    fields: [{ field: 'row', selected: 'נקראה', other: null }] }]);
+  // הנייר נסגר עם ארבע שורות — מונה מודפס וסיכום — ולכן השורה השלישית קיימת.
+  assert.deepEqual(scanConsensusDisputedRows(scan(fourRowPaper), [scan(droppedRowPaper)], { paperConfirmsRows: () => true }), []);
+  // הנייר מאשר את קיום השורה, לא את תוכנה: הבדל בשדה נשאר מחלוקת.
+  const changed = paper(fourRows().map((item, index) => index === 3 ? row({ ...item, quantity: 2, lineTotalExVat: 6 }) : item));
+  assert.deepEqual(scanConsensusDisputedRows(scan(fourRowPaper), [scan(changed)], { paperConfirmsRows: () => true })
+    .map(item => [item.rowIndex, item.fields.map(field => field.field)]), [[3, ['quantity', 'lineTotalExVat']]]);
+});
+
+test('a value the winning read shares with one other read is settled; a value nobody confirms is not', () => {
+  const agree = scan(fourRowPaper);
+  const differ = scan(paper(fourRows().map((item, index) => index === 1 ? row({ ...item, code: '221' }) : item)));
+  const differAgain = scan(paper(fourRows().map((item, index) => index === 1 ? row({ ...item, code: '212' }) : item)));
+  // שתיים מתוך שלוש: המודל היקר וקריאה זולה אחת מסכימים — אין מה לשאול.
+  assert.deepEqual(scanConsensusDisputedRows(agree, [agree, differ]), []);
+  assert.deepEqual(scanConsensusDisputedRows(agree, [differ, agree]), []);
+  // שתי הקריאות הזולות קראו אחרת — הקוד שנבחר נשאר לבדו, ולכן במחלוקת.
+  assert.deepEqual(scanConsensusDisputedRows(agree, [differ, differAgain]).map(item => [item.rowIndex, item.fields]),
+    [[1, [{ field: 'code', selected: '222', other: '221' }]]]);
+  assert.deepEqual(scanConsensusDisputedRows(agree, [differ, differ]).map(item => item.rowIndex), [1]);
+  // מול קריאה אחת בלבד אין דעה שלישית, וכל הבדל נשאר מחלוקת.
+  assert.deepEqual(scanConsensusDisputedRows(agree, [differ]).map(item => item.rowIndex), [1]);
+  // קריאה שלא ראתה את השורה אינה מאשרת אותה, אבל גם אינה חולקת על שדותיה.
+  const droppedSecond = scan(doc({ ...fourRowPaper, rows: [fourRows()[0], fourRows()[2], fourRows()[3]] }));
+  assert.deepEqual(scanConsensusDisputedRows(agree, [droppedSecond, agree]), []);
+  assert.deepEqual(scanConsensusDisputedRows(agree, [droppedSecond, differ]).map(item => [item.rowIndex, item.fields.map(field => field.field)]), [[1, ['code']]]);
+  // ושורה שאף קריאה אחרת לא ראתה — שאלה על עצם קיומה, כל עוד הנייר אינו סוגר אותה.
+  assert.deepEqual(scanConsensusDisputedRows(agree, [droppedSecond, droppedSecond]).map(item => [item.rowIndex, item.fields.map(field => field.field)]), [[1, ['row']]]);
 });
 
 test('reads that disagree escalate to Terra, and the expensive read wins', async () => {
-  const { output, calls } = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(shiftedCodes)]);
+  const thirdReading = doc({ ...shiftedCodes, rows: [shiftedCodes.rows[0], row({ ...shiftedCodes.rows[1], code: '333' })] });
+  const { output, calls } = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(thirdReading)]);
   assert.equal(calls.length, 3);
   assert.equal(calls[2].model, 'gpt-5.6-terra');
   assert.equal(output.consensus.agreed, false);
@@ -229,10 +307,42 @@ test('reads that disagree escalate to Terra, and the expensive read wins', async
   const corrective = JSON.stringify(calls[2].input);
   assert.ok(corrective.includes('שורה 2'));
   assert.ok(corrective.includes('עמודת הקוד'));
-  // גם אחרי שהמודל היקר הכריע, השורה שנחלקו עליה נשארת לאישור ידני.
+  // המודל היקר קרא קוד שלישי שאף קריאה אינה מאשרת — השורה נשארת לאישור ידני.
+  assert.equal(output.scan.documents[0].rows[1].code, '333');
   assert.equal(output.consensus.disputedRows.length, 1);
   assert.equal(output.consensus.disputedRows[0].lineNumber, 2);
+  assert.deepEqual(output.consensus.disputedRows[0].fields, [{ field: 'code', selected: '333', other: '222' }]);
   assert.ok(output.scan.warnings.some(warning => warning.includes('אישור ידני')));
+});
+
+test('the expensive read agreeing with one cheap read closes the dispute without asking', async () => {
+  const { output, calls } = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(shiftedCodes)]);
+  assert.equal(calls.length, 3);
+  assert.equal(output.consensus.escalated, true);
+  assert.equal(output.scan.documents[0].rows[1].code, '222');
+  assert.deepEqual(output.consensus.disputedRows, []);
+  assert.ok(!output.scan.warnings.some(warning => warning.includes('אישור ידני')));
+});
+
+test('a read that saw one row too many does not put the whole paper in dispute', async () => {
+  // הקריאה השנייה פיצלה שורה; ההסלמה קראה כמו הראשונה, והנייר נסגר עם ארבע שורות.
+  const { output, calls } = await request([answer(fourRowPaper), answer(splitRowPaper), answer(fourRowPaper)]);
+  assert.equal(calls.length, 3);
+  assert.equal(output.consensus.escalated, true);
+  assert.ok(output.consensus.diffs.some(diff => diff.field === 'rowCount'));
+  const corrective = JSON.stringify(calls[2].input);
+  assert.ok(corrective.includes('מספר השורות'));
+  assert.ok(corrective.includes('נקראה בקריאה אחת בלבד'));
+  assert.equal(output.paperValidation[0].ok, true);
+  assert.deepEqual(output.consensus.disputedRows, []);
+  assert.ok(!JSON.stringify(output).includes('"rowCount","selected"'));
+  // ושני קריאות זולות שפספסו שורה אינן מטילות ספק בשורה שהמודל היקר ראה והנייר סוגר.
+  const missed = doc({ ...droppedRowPaper, rows: droppedRowPaper.rows.map((item, index) => index === 0 ? row({ ...item, promoStar: true }) : item) });
+  const second = await request([answer(droppedRowPaper), answer(missed), answer(fourRowPaper)]);
+  assert.equal(second.output.consensus.escalated, true);
+  assert.equal(second.output.scan.documents[0].rows.length, 4);
+  assert.equal(second.output.paperValidation[0].ok, true);
+  assert.deepEqual(second.output.consensus.disputedRows, []);
 });
 
 test('a read that keeps failing is not a witness: the scan escalates without a second opinion', async () => {
@@ -321,7 +431,7 @@ test('a key the instance never saw says so, so the client knows to send the phot
   const output = await sendScan(server, { scanKey: 'no-such-key-01', resume: true }).ended;
   assert.equal(output.ok, false);
   assert.equal(output.error, 'resume_unknown');
-  assert.equal(output.serviceVersion, 13);
+  assert.equal(output.serviceVersion, 14);
   assert.equal(calls.length, 0);
   server.close();
 });
