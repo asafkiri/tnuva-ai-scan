@@ -59,7 +59,7 @@ const OPENAI_MAX_OUTPUT_TOKENS = 48_000;
 const OPENAI_TIMEOUT_MS = 180_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 10; // Photo-first Tnuva validation and per-attempt scan audit.
+const SERVICE_VERSION = 11; // Two parallel cheap reads, escalation on disagreement, disputed rows.
 const CHECKSUM_TOLERANCE_EX_VAT = 0.02;
 const CHECKSUM_RETRY_REASONING_EFFORT = "high";
 const FIREBASE_PROJECT_ID = "tnuva-marketkiri-5d50d";
@@ -472,6 +472,109 @@ function checksumTotalError(mismatches) {
   return (mismatches || []).reduce((total, item) => total + Math.abs(item.got - item.expected) + Math.abs((item.gotLines || 0) - (item.expectedLines || 0)) + (item.problems || []).length + (item.missingSummary ? 1000000 : 0), 0);
 }
 
+// ===== v11: קונצנזוס שתי קריאות =====
+// הכשל שנמצא בתעודה 561010707 (17.9): הכמויות, המחירים והסכומים נקראו נכון
+// בכל 28 השורות, אבל עמודת הקוד הוסטה בשורה אחת מהשורה ה-13 והלאה. בדיקת
+// הסיכומים עוברת בשלמות כשההסטה היא בזהות בלבד, ולכן שום עוגן כספי אינו יכול
+// לתפוס אותה. שתי קריאות של אותו צילום כן: סחיפה כזאת אינה חוזרת על עצמה
+// באותה צורה פעמיים, וההבדל בין הקריאות הוא הראיה. תוצאות זהות = הקריאה
+// מאושרת בלי הסלמה; הבדל כלשהו = המודל היקר מכריע, והשורות שנחלקו עולות
+// לאישור ידני של המשתמש.
+const CONSENSUS_ROW_FIELDS = ["section", "code", "quantity", "unitPriceExVat", "lineTotalExVat", "promoStar", "sourcePage"];
+const CONSENSUS_DOC_FIELDS = ["docNumber", "docDate", "docType", "pageCount", "vatPct", "itemsSectionTotalExVat",
+  "promoDiscountExVat", "itemsPrintedLines", "returnsSectionTotalExVat", "returnsPrintedLines", "subtotalExVat",
+  "vatAmount", "totalInclVat", "roundingDiff"];
+const CONSENSUS_MONEY_FIELDS = new Set(["unitPriceExVat", "lineTotalExVat", "itemsSectionTotalExVat", "promoDiscountExVat",
+  "returnsSectionTotalExVat", "subtotalExVat", "vatAmount", "totalInclVat", "roundingDiff"]);
+const MAX_CONSENSUS_DIFFS = 200;
+const MAX_CONSENSUS_CORRECTIVE_LINES = 40;
+// התיאור ורמת הביטחון משתנים בין קריאה לקריאה גם כשהנייר נקרא נכון, ולכן הם
+// אינם חלק מתנאי הזהות. מה שנשווה הוא זהות המוצר והכסף בלבד.
+function consensusValue(field, value) {
+  if (value === undefined || value === null) return null;
+  if (field === "promoStar") return value === true;
+  if (field === "quantity") return Number.isFinite(Number(value)) ? Math.round(Number(value) * 1000) : null;
+  if (CONSENSUS_MONEY_FIELDS.has(field)) return Number.isFinite(Number(value)) ? Math.round(Number(value) * 100) : null;
+  if (field === "pageCount" || field === "sourcePage" || field === "vatPct" || field === "itemsPrintedLines" || field === "returnsPrintedLines") {
+    return Number.isFinite(Number(value)) ? Number(value) : null;
+  }
+  return String(value).trim();
+}
+function consensusDisplay(field, value) {
+  if (value === undefined || value === null) return "לא נקרא";
+  if (field === "promoStar") return value === true ? "כוכבית" : "ללא כוכבית";
+  if (CONSENSUS_MONEY_FIELDS.has(field)) return Number.isFinite(Number(value)) ? `₪${Number(value).toFixed(2)}` : "לא נקרא";
+  return String(value).trim() || "לא נקרא";
+}
+// כל ההבדלים בין שתי קריאות של אותו צילום, לפי מיקום השורה בטבלה.
+export function scanConsensusDiff(first, second) {
+  const out = [];
+  const push = entry => { if (out.length < MAX_CONSENSUS_DIFFS) out.push(entry); };
+  const docsA = (first && first.documents) || [], docsB = (second && second.documents) || [];
+  const noteIndexes = [...new Set([...docsA, ...docsB].map(doc => Number(doc && doc.noteIndex)))].sort((a, b) => a - b);
+  for (const noteIndex of noteIndexes) {
+    const a = docsA.find(doc => Number(doc && doc.noteIndex) === noteIndex);
+    const b = docsB.find(doc => Number(doc && doc.noteIndex) === noteIndex);
+    if (!a || !b) { push({ noteIndex, scope: "document", field: "document", values: [a ? "נקרא" : null, b ? "נקרא" : null] }); continue; }
+    for (const field of CONSENSUS_DOC_FIELDS) {
+      if (consensusValue(field, a[field]) !== consensusValue(field, b[field])) {
+        push({ noteIndex, scope: "document", field, values: [a[field] ?? null, b[field] ?? null] });
+      }
+    }
+    const rowsA = Array.isArray(a.rows) ? a.rows : [], rowsB = Array.isArray(b.rows) ? b.rows : [];
+    if (rowsA.length !== rowsB.length) push({ noteIndex, scope: "document", field: "rowCount", values: [rowsA.length, rowsB.length] });
+    for (let index = 0; index < Math.max(rowsA.length, rowsB.length); index += 1) {
+      const rowA = rowsA[index], rowB = rowsB[index];
+      const lineNumber = Number((rowA || rowB || {}).lineNumber) || index + 1;
+      if (!rowA || !rowB) { push({ noteIndex, scope: "row", rowIndex: index, lineNumber, field: "row", values: [rowA ? "נקראה" : null, rowB ? "נקראה" : null] }); continue; }
+      for (const field of CONSENSUS_ROW_FIELDS) {
+        if (consensusValue(field, rowA[field]) !== consensusValue(field, rowB[field])) {
+          push({ noteIndex, scope: "row", rowIndex: index, lineNumber, field, values: [rowA[field] ?? null, rowB[field] ?? null] });
+        }
+      }
+    }
+  }
+  return out;
+}
+// השורות שהקריאות נחלקו עליהן, ביחס לקריאה שנבחרה — זה מה שהלקוח מעלה
+// לאישור ידני. מסמך שמספר שורותיו שונה בין הקריאות שנוי במחלוקת כולו, כי
+// מהשורה שבה נוספה או נעלמה שורה ואילך אי אפשר להשוות שורה לשורה.
+export function scanConsensusDisputedRows(selected, others) {
+  const disputed = new Map();
+  for (const other of (others || []).filter(Boolean)) {
+    for (const diff of scanConsensusDiff(selected, other)) {
+      if (diff.scope === "document" && diff.field !== "rowCount") continue;
+      const doc = ((selected && selected.documents) || []).find(item => Number(item && item.noteIndex) === diff.noteIndex);
+      const rows = doc && Array.isArray(doc.rows) ? doc.rows : [];
+      const targets = diff.field === "rowCount" ? rows.map((row, index) => index) : [diff.rowIndex];
+      for (const rowIndex of targets) {
+        if (!rows[rowIndex]) continue;
+        const key = diff.noteIndex + ":" + rowIndex;
+        if (!disputed.has(key)) {
+          disputed.set(key, { noteIndex: diff.noteIndex, rowIndex, lineNumber: Number(rows[rowIndex].lineNumber) || rowIndex + 1,
+            code: rows[rowIndex].code ?? null, description: String(rows[rowIndex].description || "").slice(0, 80), fields: [] });
+        }
+        const entry = disputed.get(key);
+        const field = diff.field === "rowCount" ? "rowCount" : diff.field;
+        if (entry.fields.length < 8 && !entry.fields.some(item => item.field === field)) {
+          entry.fields.push({ field, selected: diff.field === "rowCount" ? rows.length : (rows[rowIndex][field] ?? null), other: diff.values[1] ?? null });
+        }
+      }
+    }
+  }
+  return [...disputed.values()].sort((a, b) => a.noteIndex - b.noteIndex || a.rowIndex - b.rowIndex);
+}
+function consensusCorrectiveText(diffs) {
+  const parts = (diffs || []).slice(0, MAX_CONSENSUS_CORRECTIVE_LINES).map(diff => diff.scope === "row"
+    ? `מסמך noteIndex=${diff.noteIndex}, שורה ${diff.lineNumber}: ${diff.field} נקרא פעם ${consensusDisplay(diff.field, diff.values[0])} ופעם ${consensusDisplay(diff.field, diff.values[1])}.`
+    : `מסמך noteIndex=${diff.noteIndex}: ${diff.field} נקרא פעם ${consensusDisplay(diff.field, diff.values[0])} ופעם ${consensusDisplay(diff.field, diff.values[1])}.`);
+  return `שתי קריאות קודמות של אותו צילום נחלקו: ${parts.join(" ")}` +
+    ` קרא את הנייר מחדש מההתחלה, ואל תבחר בין שתי הקריאות הקודמות — שתיהן עשויות לטעות.` +
+    ` כשל ידוע בנייר הזה: עמודת הקוד נקראת בהסטה של שורה אחת, כך שקוד של שורה אחת נדבק לכמות ולמחיר של השורה שאחריה.` +
+    ` לכן ודא לכל שורה שהקוד, התיאור, הכמות, המחיר והסכום נקראו כולם מאותה שורה אופקית בטבלה, ושמספר השורות שקראת שווה למונה "פריטים" המודפס.` +
+    ` קוד שאינו קריא בביטחון — החזר null לאותה שורה בלבד, ואל תזיז בגללו את שאר העמודה.`;
+}
+
 
 function checksumCorrectiveText(mismatches) {
   const parts = mismatches.map(item =>
@@ -752,6 +855,15 @@ function getOpenAIRetryServiceTier(env, baseTier) {
   if (configured === "priority") return "priority";
   if (configured === "default") return "default";
   return baseTier;
+}
+
+// v11: מספר הקריאות המקבילות למודל הזול. 2 = ברירת המחדל שהוחלטה (17.9):
+// כפל עלות על הקריאה הזולה, ובתמורה הסטת זהות נתפסת לפני שהיא מגיעה לקליטה.
+// OPENAI_CONSENSUS_READS=1 ב-Cloud Run מחזיר את ההתנהגות הישנה בלי שינוי קוד.
+function getConsensusReads(env) {
+  const configured = Number.parseInt(typeof env.OPENAI_CONSENSUS_READS === "string" ? env.OPENAI_CONSENSUS_READS.trim() : "", 10);
+  if (Number.isInteger(configured) && configured >= 1 && configured <= 3) return configured;
+  return 2;
 }
 
 // ===== v130: המנתח — בניית הקלט, אימות הפלט =====
@@ -1072,6 +1184,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
       const openaiServiceTier = getOpenAIServiceTier(env);
       const openaiRetryModel = getOpenAIRetryModel(env);
       const openaiRetryTier = getOpenAIRetryServiceTier(env, openaiServiceTier);
+      const consensusReads = getConsensusReads(env);
 
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
         writeJson(response, origin, 200, {
@@ -1438,7 +1551,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
 
       // אותה ארכיטקטורה כמו יטבתה v133: קריאה, אימות מול העוגן, ובמקרה כישלון —
       // קריאה מלאה נוספת אחת במאמץ גבוה; הקריאה הטובה יותר מנצחת.
-      const attemptScan = async (correctiveText, reasoningEffort, escalate) => {
+      const attemptScan = async (correctiveText, reasoningEffort, escalate, stage) => {
         // v135: escalate=true רק בקריאת האימות החוזרת. אם הוגדר מודל הסלמה —
         // הקריאה הזאת רצה עליו (ובמצב המהיר של ההסלמה); אחרת הכול כרגיל.
         const callModel = escalate && openaiRetryModel ? openaiRetryModel : openaiModel;
@@ -1446,7 +1559,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
         const attemptContent = correctiveText
           ? content.concat([{ type: "input_text", text: correctiveText }])
           : content;
-        const audit = { stage: escalate ? 'checksum_retry' : 'initial', requestedModel: callModel,
+        const audit = { stage: stage || (escalate ? 'checksum_retry' : 'initial'), requestedModel: callModel,
           model: callModel, serviceTier: callTier, startedAt: now(), selected: false };
         scanAudit.attempts.push(audit);
         const controller = new AbortController();
@@ -1536,10 +1649,40 @@ function decodeAnalyzeClaims(result, aliasToId) {
         return { scan, data, openaiResponse, audit };
       };
 
-      let attempt = await attemptScan(null, OPENAI_REASONING_EFFORT);
-      if (attempt.fail) {
-        finishScan(attempt.fail.body);
+      // v11: הקריאות הזולות יוצאות יחד. הראשונה שחוזרת אינה מנצחת — שתיהן
+      // נשמרות, וההשוואה ביניהן היא שמחליטה אם צריך את המודל היקר.
+      const reads = await Promise.all(Array.from({ length: consensusReads },
+        (unused, index) => attemptScan(null, OPENAI_REASONING_EFFORT, false, consensusReads > 1 ? 'consensus_' + (index + 1) : 'initial')));
+      const goodReads = reads.filter(read => !read.fail);
+      if (!goodReads.length) {
+        finishScan(reads[0].fail.body);
         return;
+      }
+      const consensus = { attempted: consensusReads > 1, reads: consensusReads, completedReads: goodReads.length,
+        model: openaiModel, agreed: null, escalated: false, escalationModel: null, escalationError: null,
+        reason: null, diffs: [], disputedRows: [] };
+      let attempt = goodReads[0];
+      if (consensusReads > 1) {
+        if (goodReads.length < consensusReads) {
+          // קריאה שנפלה אינה עד. בלי דעה שנייה אין אישור, ולכן מסלימים.
+          consensus.agreed = false;
+          consensus.reason = 'read_failed';
+        } else {
+          consensus.diffs = scanConsensusDiff(goodReads[0].scan, goodReads[1].scan);
+          consensus.agreed = consensus.diffs.length === 0;
+          if (!consensus.agreed) consensus.reason = 'reads_disagree';
+        }
+        for (const read of goodReads) read.audit.consensus = consensus.agreed ? 'agreed' : 'disputed';
+        if (!consensus.agreed) {
+          const escalation = await attemptScan(consensusCorrectiveText(consensus.diffs), CHECKSUM_RETRY_REASONING_EFFORT, true, 'consensus_escalation');
+          if (escalation.fail) {
+            consensus.escalationError = escalation.fail.body && escalation.fail.body.error || 'escalation_failed';
+          } else {
+            consensus.escalated = true;
+            consensus.escalationModel = escalation.audit.requestedModel;
+            attempt = escalation;
+          }
+        }
       }
       let { scan, data, openaiResponse } = attempt;
       attempt.audit.selected = true;
@@ -1616,6 +1759,17 @@ function decodeAnalyzeClaims(result, aliasToId) {
         }
       }
 
+      // השורות שבמחלוקת נמדדות מול הקריאה שנבחרה בפועל — גם אם קריאת ההצלה
+      // של סכום הביקורת החליפה אותה אחרי ההסלמה.
+      if (consensus.attempted && consensus.agreed === false) {
+        consensus.disputedRows = scanConsensusDisputedRows(scan, goodReads.map(read => read.scan).filter(value => value !== scan));
+        for (const item of consensus.disputedRows) {
+          const warning = `שתי הקריאות של הצילום נחלקו על שורה ${item.lineNumber} בתעודה ${item.noteIndex + 1}` +
+            (item.description ? ` (${item.description})` : "") + ` — השורה דורשת אישור ידני לפני קליטה.`;
+          if (!scan.warnings.includes(warning)) scan.warnings.push(warning);
+        }
+      }
+
       finishScan({
         ok: true,
         serviceVersion: SERVICE_VERSION,
@@ -1624,6 +1778,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
         paperValidation: photoFirst ? paperChecks(scan) : null,
         requestId: data.id || openaiResponse.headers.get("x-request-id") || null,
         usage: data.usage || null,
+        consensus, // v11: מה כל קריאה ראתה, ואילו שורות נותרו במחלוקת
         checksumRetryAttempted,
         checksumRetryModel: checksumRetryAttempted ? (openaiRetryModel || openaiModel) : null, // v7: מי ביצע את קריאת ההצלה
       });
