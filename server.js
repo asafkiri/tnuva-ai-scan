@@ -399,7 +399,12 @@ export function tnuvaPaperCheck(input, pageCount) {
   const net = itemsCents - promo - returnsCents;
   const credit = doc && doc.docType === 'credit';
   const expected = credit && subtotal != null ? Math.abs(subtotal) : subtotal;
-  if (expected != null && net !== expected) problems.push('סכומי השורות פחות הנחת המבצעים וההחזרות אינם שווים לסהכ חייב מעמ');
+  // The numbers themselves, not only the fact that they differ. The bare
+  // sentence left the user with nothing to compare against the paper.
+  const shekels = value => '₪' + (value / 100).toFixed(2);
+  if (expected != null && net !== expected) problems.push('החשבון לא נסגר: שורות הפריטים ' + shekels(itemsCents) +
+    (promo ? ' פחות הנחה ' + shekels(promo) : '') + (returnsCents ? ' פחות החזרות ' + shekels(returnsCents) : '') +
+    ' = ' + shekels(net) + ', אבל "סהכ חייב מעמ" נקרא ' + shekels(expected) + ' (הפרש ' + shekels(Math.abs(net - expected)) + ')');
   if (credit) review.push('זו חשבונית זיכוי — יש להזין אותה במסך החזרות, ולא כקליטת סחורה');
   else if (!doc || doc.docType !== 'invoice') review.push('סוג התעודה לא זוהה בוודאות — יש לבדוק את הכותרת');
   if (returnLines || (returnSummary != null && returnSummary !== 0)) review.push('התעודה כוללת החזרות. יש להפריד אותן לפי תהליך ההחזרות הקיים ולהזין ידנית את נתוני הקליטה');
