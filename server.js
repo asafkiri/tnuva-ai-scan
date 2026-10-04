@@ -62,7 +62,7 @@ const OPENAI_TIMEOUT_MS = 180_000;
 export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 14; // Rows are compared by content, and a row two reads agree on is not disputed.
+const SERVICE_VERSION = 15; // Promo sheets can identify existing catalog products without printed barcodes.
 // v13: עבודת סריקה נשמרת חצי שעה אחרי שהסתיימה, ושעה לכל היותר מרגע שנפתחה.
 // זה מכסה בנוחות טלפון שנפל וחוזר, ואינו מחזיק זיכרון מעבר לכך.
 const SCAN_JOB_TTL_MS = 30 * 60 * 1000;
@@ -194,6 +194,7 @@ const promoSheetRowSchema = {
   required: [
     "barcode", "name", "listPrice", "discountPct", "promoPrice",
     "noteText", "noteKind", "noteStartDate", "noteEndDate", "noteMinUnits", "confidence",
+    "sourceLine", "productHintId", "candidateProductHintIds", "matchConfidence",
   ],
   properties: {
     barcode: nullable("string"),
@@ -207,6 +208,10 @@ const promoSheetRowSchema = {
     noteEndDate: nullable("string"),
     noteMinUnits: nullable("number"),
     confidence: { type: "number" },
+    sourceLine: nullable("number"),
+    productHintId: nullable("string"),
+    candidateProductHintIds: { type: "array", maxItems: 8, items: { type: "string" } },
+    matchConfidence: { type: "number" },
   },
 };
 
@@ -228,7 +233,7 @@ const PROMO_SHEET_SYSTEM_PROMPT = `אתה קורא דף מבצעים חודשי 
 מבנה שורת מוצר (מימין לשמאל): ברקוד תנובה בן 13 ספרות | שם המוצר | מחיר מחירון | אחוז הנחה | מחיר מבצע. בקצה השמאלי של השורה, אחרי מחיר המבצע, יושבת לפעמים הערה חופשית.
 
 כללים מחייבים:
-1. barcode הוא 13 הספרות כפי שהודפסו. אינן קריאות — null.
+1. barcode הוא 13 הספרות כפי שהודפסו. אינן קריאות, מופיעות כ-#### או חסרה ספרה — null. כלול גם שורות בלי ברקוד; לעולם אל תשלים ברקוד מהמאגר או מהידע שלך.
 2. listPrice, discountPct ו-promoPrice נקראים מהעמודות שלהם בלבד. הטקסט עלול להגיע דבוק (למשל "19.607%18.23"). ההפרדה הנכונה נקבעת לפי החשבון: מחיר המחירון כפול (1 פחות האחוז חלקי 100) חייב לתת את מחיר המבצע, עד אגורה. פיצול שאינו מקיים את החשבון הזה שגוי — גם אם הוא נראה סביר. בדוגמה הזאת הפיצול הנכון הוא מחירון 19.60, אחוז 7, מבצע 18.23.
 3. האחוז מודפס לפעמים עם שתי ספרות אחרי הנקודה ("18.00%") ולפעמים בלעדיהן ("7%"). שתי הצורות חוקיות באותה מידה. החזר את הערך המספרי כפי שהוא.
 4. אל תמציא מספר ואל תתקן מספר שנראה. שדה שאינו קריא — null, ואזהרה ב-warnings.
@@ -238,6 +243,9 @@ const PROMO_SHEET_SYSTEM_PROMPT = `אתה קורא דף מבצעים חודשי 
 8. noteMinUnits הוא מספר יחידות שלם, ורק כאשר ההערה קובעת תנאי רכישה מחייב. הערה שהיא המלצה ולא תנאי (נפתחת ב"המלצה", "המלצת" או ניסוח דומה) אינה תנאי: החזר noteMinUnits=null ו-noteKind="other".
 9. הערה מודפסת על שורה אחת. אם לפי המיקום היא נראית נוגעת גם לשורות סמוכות — אל תשכפל אותה לשורות אחרות; החזר אותה על השורה שבה היא מודפסת בפועל, וציין את הספק ב-warnings.
 10. validFrom ו-validTo הם תוקף הדף כולו לפי הכותרת — בדרך כלל היום הראשון והאחרון של החודש המודפס — בפורמט YYYY-MM-DD. אינם ברורים — null.
+11. sourceLine הוא מספר L של השורה שבה יושבים אחוז ההנחה, מחיר המחירון ותא הברקוד (או ####). השם ומחיר המבצע עשויים לשבת בשורות סמוכות בגובה y שונה: חבר רק את הפיסות השייכות לאותה שורת טבלה. החזר כל שורת מוצר פעם אחת בלבד. כותרות ועמודים ריקים אינם מוצרים.
+12. כשמצורף מאגר, התאם לפי שם, סדרה, טעם, אחוז שומן, נפח ומשקל. מחיר המחירון הוא ראיה נוספת בלבד: מחיר זהה אינו מוכיח שזה אותו מוצר. מספר גרמי חלבון אינו בהכרח משקל האריזה. אין לשייך מבצע לכל הטעמים או לכל הגדלים רק כי הם דומים.
+13. productHintId יכול להיות רק כינוי מתוך המאגר המצורף. התאמה ברורה ויחידה: החזר אותו גם כמועמד היחיד ב-candidateProductHintIds, ו-matchConfidence בין 0 ל-1. כשמידע חסר משאיר כמה מוצרים אפשריים (למשל בולגרית 5% ללא גודל), החזר productHintId=null ואת המועמדים האפשריים. אין התאמה או אין מאגר: null, מערך ריק, וביטחון 0. השם והמחירים מוחזרים כפי שנקראו מהדף, גם כשלא נמצאה התאמה.
 11. name מועתק כפי שמודפס, גם אם הוא מקוצר. אל תרחיב אותו ואל תתקן אותו לפי מוצר מוכר.
 12. confidence משקף עד כמה השורה נשענת על הטקסט עצמו ולא על פרשנות.
 13. שורה שאין בה ברקוד בן 13 ספרות אינה שורת מוצר (כותרות, כותרות עמודה, הערות כלליות) — אל תחזיר אותה.
@@ -1308,11 +1316,11 @@ ${JSON.stringify({ units: numOrNull(gap.units), amountExVat: numOrNull(gap.amoun
 // v8: הקלט של קורא דף המבצעים — הטקסט של הדף כפי שנקרא בטלפון, עם המיקום
 // האופקי של כל פיסה. המיקום הוא מה שמבדיל בין עמודת הטבלה לבין הערה בשוליים,
 // ובלעדיו המודל רואה שורה דבוקה בלי לדעת איפה נגמרה הטבלה והתחילה ההערה.
-function buildPromoSheetUserText(sheet) {
+function buildPromoSheetUserText(sheet, hints = []) {
   const title = analyzeText(sheet && sheet.title, 300);
   const lines = (Array.isArray(sheet && sheet.lines) ? sheet.lines : []).slice(0, PROMO_SHEET_MAX_LINES);
   const byPage = new Map();
-  for (const line of lines) {
+  for (const [index, line] of lines.entries()) {
     const rawPage = analyzeNum(line && line.page);
     const page = rawPage == null ? 1 : Math.min(99, Math.max(1, Math.round(rawPage)));
     const parts = (Array.isArray(line && line.parts) ? line.parts : [])
@@ -1325,13 +1333,15 @@ function buildPromoSheetUserText(sheet) {
       .filter(Boolean);
     if (!parts.length) continue;
     if (!byPage.has(page)) byPage.set(page, []);
-    byPage.get(page).push(parts.join("  |  "));
+    const y = analyzeNum(line && line.y);
+    byPage.get(page).push(`L${index + 1}${y == null ? "" : ` [y=${Math.round(y)}]`}: ${parts.join("  |  ")}`);
   }
   const sections = [`=== כותרת הדף ===\n${title || "(לא נקראה)"}`];
   for (const page of [...byPage.keys()].sort((left, right) => left - right)) {
     const rows = byPage.get(page);
     sections.push(`=== עמוד ${page} (${rows.length} שורות) ===\n${rows.join("\n")}`);
   }
+  if (hints.length) sections.push(`=== מוצרים קיימים במאגר (${hints.length}) ===\nהכינויים זמניים. המחיר הוא מחירון לפני מע״מ. בחר רק מתוך הרשימה, ואל תחזיר כינוי כשיש כמה התאמות אפשריות.\n${JSON.stringify(hints.map(({ id, name, price }) => ({ id, name, ...(price == null ? {} : { price }) })))}`);
   return sections.join("\n\n");
 }
 function validPromoSheetResult(result) {
@@ -1348,12 +1358,16 @@ function validPromoSheetResult(result) {
       if (!finiteOrNull(row[field])) return false;
     }
     if (typeof row.confidence !== "number" || !Number.isFinite(row.confidence)) return false;
+    if (row.sourceLine != null && (!Number.isInteger(row.sourceLine) || row.sourceLine < 1 || row.sourceLine > PROMO_SHEET_MAX_LINES)) return false;
+    if (row.productHintId != null && typeof row.productHintId !== "string") return false;
+    if (row.candidateProductHintIds != null && (!Array.isArray(row.candidateProductHintIds) || row.candidateProductHintIds.length > 8 || row.candidateProductHintIds.some(id => typeof id !== "string"))) return false;
+    if (row.matchConfidence != null && (!Number.isFinite(row.matchConfidence) || row.matchConfidence < 0 || row.matchConfidence > 1)) return false;
   }
   return true;
 }
 // המספרים עוברים כפי שנקראו — ההוכחה שלהם נעשית בלקוח, לא כאן. מה שכן נעשה
 // כאן: גזירת מחרוזות לאורך סביר, כדי ששדה טקסט חופשי לא ייכנס למסך בלי גבול.
-function decodePromoSheetRows(result) {
+function decodePromoSheetRows(result, aliasToId = new Map()) {
   // v8: null חייב להישאר null. Number(null)===0, ולכן analyzeNum לבדו היה
   // הופך "המחיר לא נקרא" ל"מחיר 0" ו"אין תנאי כמות" ל"מינימום 0" — בדיוק
   // השקר ששורה 715 כבר מזהירה ממנו בצד המנתח.
@@ -1370,6 +1384,10 @@ function decodePromoSheetRows(result) {
     noteEndDate: row.noteEndDate == null ? null : analyzeText(row.noteEndDate, 10),
     noteMinUnits: numOrNull(row.noteMinUnits),
     confidence: analyzeNum(row.confidence) || 0,
+    sourceLine: row.sourceLine == null ? null : row.sourceLine,
+    productId: aliasToId.get(row.productHintId) || null,
+    candidateProductIds: [...new Set((row.candidateProductHintIds || []).map(id => aliasToId.get(id)).filter(Boolean))],
+    matchConfidence: row.matchConfidence == null ? 0 : row.matchConfidence,
   }));
 }
 function validAnalyzeResult(result) {
@@ -1445,6 +1463,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
           fastMode: openaiServiceTier === "priority",
           photoFirst: true, scanAuditVersion: 1,
           resumableScans: true, // v13: סריקה ששרדה נתק ניתנת לאיסוף עם אותו מפתח
+          promoCatalogMatching: true,
           retryModel: openaiRetryModel || null,
           retryServiceTier: openaiRetryModel ? openaiRetryTier : null,
           keyConfigured: keyStatus === "ready",
@@ -1644,7 +1663,8 @@ function decodeAnalyzeClaims(result, aliasToId) {
           writeJson(response, origin, 400, { ok: false, error: "invalid_promo_sheet_input" });
           return;
         }
-        const promoPrompt = buildPromoSheetUserText(sheet);
+        const { hints, aliasToId } = analyzeCatalogAliases(sheet.catalog);
+        const promoPrompt = buildPromoSheetUserText(sheet, hints);
         const promoController = new AbortController();
         const promoTimeout = setTimeout(() => promoController.abort(), PROMO_SHEET_TIMEOUT_MS);
         let promoResponse;
@@ -1725,12 +1745,13 @@ function decodeAnalyzeClaims(result, aliasToId) {
           sheet: {
             validFrom: promoResult.validFrom == null ? null : analyzeText(promoResult.validFrom, 10),
             validTo: promoResult.validTo == null ? null : analyzeText(promoResult.validTo, 10),
-            rows: decodePromoSheetRows(promoResult),
+            rows: decodePromoSheetRows(promoResult, aliasToId),
             warnings: promoResult.warnings.slice(0, 40).map(warning => analyzeText(warning, 240)).filter(Boolean),
           },
           model: promoData.model || openaiModel,
           requestId: promoData.id || promoResponse.headers.get("x-request-id") || null,
           usage: promoData.usage || null,
+          promoCatalogMatching: true,
         });
         return;
       }
