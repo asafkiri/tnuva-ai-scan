@@ -110,6 +110,48 @@ async function request(responses, documents = input, extraEnv = {}) {
   return { output, calls, logs };
 }
 const answer = document => ({ output_text: JSON.stringify(scan(document)) });
+const promoRow = (changes = {}) => ({ barcode: null, name: 'בולגרית 5%', listPrice: 18.42, discountPct: 15, promoPrice: 15.66,
+  noteText: null, noteKind: 'none', noteStartDate: null, noteEndDate: null, noteMinUnits: null, confidence: .99,
+  sourceLine: 1, productHintId: 'a0', candidateProductHintIds: ['a0'], matchConfidence: .98, ...changes });
+const promoInput = { mode: 'promoSheet', sheet: { title: 'אוקטובר 2026',
+  lines: [{ page: 1, y: 700, parts: [[84, '15.66'], [139, '15%'], [196, '18.42'], [300, 'בולגרית 5%'], [474, '############']] }],
+  catalog: [{ id: 'catalog-cheese', name: 'בולגרית 5% 250 גרם', price: 18.42, barcode: '7290000000008' }] } };
+async function requestPromo(rows) {
+  const { server, calls } = scanServer([{ output_text: JSON.stringify({ validFrom: '2026-10-01', validTo: '2026-10-31', rows, warnings: [] }) }]);
+  const output = await sendScan(server, promoInput).ended;
+  server.close();
+  return { output, calls };
+}
+test('promo sheets without barcodes match only catalog aliases and preserve the original numbers', async () => {
+  const { output, calls } = await requestPromo([promoRow()]);
+  assert.equal(output.ok, true);
+  assert.equal(output.promoCatalogMatching, true);
+  assert.equal(output.serviceVersion, 15);
+  assert.equal(output.sheet.rows[0].barcode, null);
+  assert.equal(output.sheet.rows[0].productId, 'catalog-cheese');
+  assert.deepEqual(output.sheet.rows[0].candidateProductIds, ['catalog-cheese']);
+  assert.equal(output.sheet.rows[0].sourceLine, 1);
+  assert.equal(output.sheet.rows[0].discountPct, 15);
+  assert.equal(calls.length, 1);
+  const userText = calls[0].input[1].content[0].text;
+  assert.match(userText, /L1 \[y=700\]/);
+  assert.match(userText, /בולגרית 5% 250 גרם/);
+  assert.match(userText, /"id":"a0"/);
+  assert.doesNotMatch(userText, /catalog-cheese|7290000000008/);
+  assert.ok(calls[0].text.format.schema.properties.rows.items.required.includes('productHintId'));
+});
+test('promo matching does not accept invented product aliases or convert missing money to zero', async () => {
+  const { output } = await requestPromo([promoRow({ productHintId: 'invented', candidateProductHintIds: ['invented', 'a0'], listPrice: null })]);
+  assert.equal(output.ok, true);
+  assert.equal(output.sheet.rows[0].productId, null);
+  assert.deepEqual(output.sheet.rows[0].candidateProductIds, ['catalog-cheese']);
+  assert.equal(output.sheet.rows[0].listPrice, null);
+});
+test('malformed identity fields from a promo model are rejected before reaching the client', async () => {
+  const { output } = await requestPromo([promoRow({ candidateProductHintIds: 'a0' })]);
+  assert.equal(output.ok, false);
+  assert.equal(output.error, 'invalid_model_output');
+});
 // v11: כל סריקה יוצאת פעמיים במקביל למודל הזול, ולכן תרחיש שפעם צרך תשובה
 // אחת צורך שתיים זהות. שתי תשובות זהות = הסכמה, בלי הסלמה.
 const agreed = document => [answer(document), answer(document)];
@@ -556,7 +598,7 @@ test('a key the instance never saw says so, so the client knows to send the phot
   const output = await sendScan(server, { scanKey: 'no-such-key-01', resume: true }).ended;
   assert.equal(output.ok, false);
   assert.equal(output.error, 'resume_unknown');
-  assert.equal(output.serviceVersion, 14);
+  assert.equal(output.serviceVersion, 15);
   assert.equal(calls.length, 0);
   server.close();
 });
