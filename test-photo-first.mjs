@@ -126,7 +126,7 @@ test('promo sheets without barcodes match only catalog aliases and preserve the 
   const { output, calls } = await requestPromo([promoRow()]);
   assert.equal(output.ok, true);
   assert.equal(output.promoCatalogMatching, true);
-  assert.equal(output.serviceVersion, 15);
+  assert.equal(output.serviceVersion, 16);
   assert.equal(output.sheet.rows[0].barcode, null);
   assert.equal(output.sheet.rows[0].productId, 'catalog-cheese');
   assert.deepEqual(output.sheet.rows[0].candidateProductIds, ['catalog-cheese']);
@@ -138,6 +138,10 @@ test('promo sheets without barcodes match only catalog aliases and preserve the 
   assert.match(userText, /בולגרית 5% 250 גרם/);
   assert.match(userText, /"id":"a0"/);
   assert.doesNotMatch(userText, /catalog-cheese|7290000000008/);
+  const instructions = calls[0].input[0].content[0].text;
+  assert.match(instructions, /מאצ'ה אינו סחלב/);
+  assert.match(instructions, /candidateProductHintIds=\[\]/);
+  assert.doesNotMatch(instructions, /שורה שאין בה ברקוד בן 13 ספרות אינה שורת מוצר/);
   assert.ok(calls[0].text.format.schema.properties.rows.items.required.includes('productHintId'));
 });
 test('promo matching does not accept invented product aliases or convert missing money to zero', async () => {
@@ -598,7 +602,7 @@ test('a key the instance never saw says so, so the client knows to send the phot
   const output = await sendScan(server, { scanKey: 'no-such-key-01', resume: true }).ended;
   assert.equal(output.ok, false);
   assert.equal(output.error, 'resume_unknown');
-  assert.equal(output.serviceVersion, 15);
+  assert.equal(output.serviceVersion, 16);
   assert.equal(calls.length, 0);
   server.close();
 });
