@@ -760,6 +760,32 @@ export function scanConsensusMissingRows(selected, others, options = {}) {
     .map(({ reads: unused, ...entry }) => entry)
     .sort((a, b) => a.noteIndex - b.noteIndex || a.lineNumber - b.lineNumber);
 }
+// v17: תאריך שלא נקרא היטב. הבדל בתאריך אינו מסלים עוד, ולכן קריאה זולה
+// שתאריכה שונה מזה של הקריאה המקבילה יכולה להיבחר בלי שאיש הכריע ביניהן.
+// הכרעת בעל החנות: תאריך שלא נקרא היטב — היום. הלקוח משתמש בתאריך הנייר רק
+// כיום שבו נבדקים המחירים ותוקף המבצעים, וצריך לדעת מתי אין לסמוך עליו.
+// המסמכים שמוחזרים כאן הם אלה שקריאה אחרת (מאותן עדות של השורות שבמחלוקת)
+// קראה בהם תאריך אחר, ואף קריאה אחרת אינה מאשרת את התאריך שנבחר. התאריכים
+// מושווים כמו בהשוואת הקריאות (consensusValue), ישירות מהמסמכים — לא מתוך
+// diffs, שנקטעים אחרי MAX_CONSENSUS_DIFFS. קריאה שלא קראה תאריך (null) או
+// לא קראה את המסמך כלל אינה מאשרת, ולכן נספרת כחולקת. בלי אף עד אין מחלוקת
+// ואין כאן מסמך: unverifiedSingleRead כבר אומר שאף קריאה אינה מאשרת דבר.
+// הערך המודפס אינו משתנה: הקריאה שנבחרה מוחזרת כפי שנקראה.
+export function scanConsensusDocDateUnconfirmed(selected, others) {
+  const reads = (others || []).filter(Boolean);
+  if (!reads.length) return [];
+  const out = new Set();
+  for (const doc of (selected && selected.documents) || []) {
+    const noteIndex = Number(doc && doc.noteIndex);
+    const date = consensusValue("docDate", doc && doc.docDate);
+    const confirmed = reads.some(other => {
+      const otherDoc = ((other && other.documents) || []).find(item => Number(item && item.noteIndex) === noteIndex);
+      return Boolean(otherDoc) && consensusValue("docDate", otherDoc.docDate) === date;
+    });
+    if (!confirmed) out.add(noteIndex);
+  }
+  return [...out].sort((a, b) => a - b);
+}
 // v17: קריאת ההכרעה קוראת את הצילום בעצמה. עד שירות 16 היא קיבלה את שני
 // הערכים ("נקרא פעם X ופעם Y") — ומודל שמקבל שתי תשובות בוחר ביניהן במקום
 // לקרוא את הנייר, ועד שבוחר בין שתי טעויות אינו עד שלישי. עכשיו היא מקבלת רק
@@ -2013,7 +2039,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
       const consensus = { attempted: consensusReads > 1, reads: consensusReads, completedReads: goodReads.length,
         model: openaiModel, agreed: null, escalated: false, escalationModel: null, escalationError: null,
         escalationSelected: false, unverifiedSingleRead: false,
-        reason: null, diffs: [], disputedRows: [], missingRows: [] };
+        reason: null, diffs: [], disputedRows: [], missingRows: [], docDateUnconfirmed: [] };
       let attempt = goodReads[0];
       let escalationRead = null; // v14: גם קריאת ההסלמה היא עדה, אם קריאת ההצלה החליפה אותה אחר כך
       if (consensusReads > 1) {
@@ -2165,6 +2191,9 @@ function decodeAnalyzeClaims(result, aliasToId) {
         const warning = `רק קריאה אחת של הצילום הושלמה — הקריאה המקבילה וקריאת ההכרעה נכשלו, ולכן אף קריאה אחרת אינה מאשרת את הקודים, הכמויות והסכומים. בדוק את השורות מול הנייר לפני קליטה.`;
         if (!scan.warnings.includes(warning)) scan.warnings.push(warning);
       }
+      // v17: התאריך נמדד מול אותן עדות, גם כשהקריאות "הסכימו" — הבדל בתאריך
+      // לבדו אינו מבטל את ההסכמה, וזה בדיוק המקרה שבו אף אחד לא הכריע אותו.
+      if (consensus.attempted) consensus.docDateUnconfirmed = scanConsensusDocDateUnconfirmed(scan, witnesses);
       consensus.escalationSelected = escalationRead !== null && escalationRead.scan === scan;
 
       finishScan({

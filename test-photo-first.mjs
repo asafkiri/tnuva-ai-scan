@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
-import { tnuvaPaperCheck, scanChecksumMismatches, scanConsensusDiff, scanConsensusDisputedRows, scanConsensusMissingRows, alignConsensusRows, OPENAI_NETWORK_RETRY_WINDOW_MS, scanJobKey, scanJobId, createServer } from './server.js';
+import { tnuvaPaperCheck, scanChecksumMismatches, scanConsensusDiff, scanConsensusDisputedRows, scanConsensusMissingRows, scanConsensusDocDateUnconfirmed, alignConsensusRows, OPENAI_NETWORK_RETRY_WINDOW_MS, scanJobKey, scanJobId, createServer } from './server.js';
 
 const image = 'data:image/jpeg;base64,YQ==';
 const catalog = [{ id: 'milk', name: 'חלב בדיקה', barcode: '7290000000008' }];
@@ -169,6 +169,7 @@ test('normal photo: two parallel Luna reads agree and nothing escalates', async 
   assert.equal(output.consensus.escalationSelected, false);
   assert.equal(output.consensus.unverifiedSingleRead, false);
   assert.deepEqual(output.consensus.disputedRows, []);
+  assert.deepEqual(output.consensus.docDateUnconfirmed, [], 'both reads read the same date');
   assert.equal(output.checksumRetryAttempted, false);
   assert.equal(output.paperValidation[0].ok, true);
   assert.equal(output.scanAudit.attempts[0].model, 'gpt-5.6-luna');
@@ -487,6 +488,9 @@ test('v17: one cheap read failed and the strong read failed too — the lone rea
   assert.equal(output.consensus.escalationError, 'openai_network_error');
   assert.equal(output.consensus.unverifiedSingleRead, true);
   assert.deepEqual(output.consensus.disputedRows, []);
+  // אין עד שקרא תאריך אחר, ולכן התאריך אינו מסומן בנפרד: הסימון של קריאה בודדת
+  // כבר אומר שאף קריאה אינה מאשרת דבר, והלקוח מחליט לפיו.
+  assert.deepEqual(output.consensus.docDateUnconfirmed, []);
   assert.ok(output.scan.warnings.some(warning => warning.startsWith('רק קריאה אחת של הצילום הושלמה') && warning.includes('לפני קליטה')));
   assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected]),
     [['consensus_1', true], ['consensus_2', false], ['consensus_2_retry', false], ['consensus_escalation', false]]);
@@ -546,6 +550,81 @@ test('v17: a date or a page the reads disagree on costs no escalation', async ()
   const vat = await request([answer(doc()), answer(doc({ vatAmount: 9.01, totalInclVat: 59.01 }))]);
   assert.equal(vat.calls.length, 2);
   assert.equal(vat.output.consensus.agreed, true);
+});
+
+// v17: הכרעת בעל החנות — תאריך שלא נקרא היטב, היום. השירות אינו מחליף את
+// התאריך המודפס; הוא אומר לאיזו תעודה אף קריאה אחרת אינה מאשרת את התאריך שנבחר.
+test('v17: a date no other read confirms is named, though nothing escalates and the printed date stays', async () => {
+  const { output, calls } = await request([answer(doc()), answer(doc({ docDate: '1.9.2026' }))]);
+  assert.equal(calls.length, 2, 'still no escalation for a date');
+  assert.equal(output.consensus.agreed, true);
+  assert.deepEqual(output.consensus.docDateUnconfirmed, [0]);
+  assert.equal(output.scan.documents[0].docDate, '7.9.2026', 'the printed value is returned as read');
+  assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected]), [['consensus_1', true], ['consensus_2', false]]);
+  assert.ok(!output.scan.warnings.length, 'the app shows the assumed day; the service adds no warning');
+  // אותו תאריך בשתי הקריאות — גם כשהן נבדלות ברווח בלבד — הוא תאריך מאושר.
+  const same = await request([answer(doc()), answer(doc({ docDate: ' 7.9.2026 ' }))]);
+  assert.deepEqual(same.output.consensus.diffs, []);
+  assert.deepEqual(same.output.consensus.docDateUnconfirmed, []);
+  // קריאה שלא קראה תאריך כלל אינה מאשרת את התאריך שנבחר.
+  const unread = await request([answer(doc()), answer(doc({ docDate: null }))]);
+  assert.equal(unread.calls.length, 2);
+  assert.deepEqual(unread.output.consensus.docDateUnconfirmed, [0]);
+});
+
+test('v17: after an escalation the date is measured against every witness, like the disputed rows', async () => {
+  const dated = (value, docDate) => doc({ ...value, docDate });
+  // ההכרעה נבחרה (שוויון בנייר) וקראה את התאריך כמו הקריאה הזולה הראשונה: מאושר.
+  const confirmed = await request([answer(dated(shiftedCodes, '7.9.2026')), answer(dated(shiftedCodesOther, '1.9.2026')), answer(dated(shiftedCodes, '7.9.2026'))]);
+  assert.equal(confirmed.calls.length, 3);
+  assert.equal(confirmed.output.consensus.escalationSelected, true);
+  assert.deepEqual(confirmed.output.consensus.docDateUnconfirmed, []);
+  // ההכרעה קראה תאריך שלישי: אף עד אינו מאשר אותו, והוא מוחזר כפי שנקרא.
+  const third = await request([answer(dated(shiftedCodes, '7.9.2026')), answer(dated(shiftedCodesOther, '1.9.2026')), answer(dated(shiftedCodes, '9.9.2026'))]);
+  assert.equal(third.output.consensus.escalationSelected, true);
+  assert.deepEqual(third.output.consensus.docDateUnconfirmed, [0]);
+  assert.equal(third.output.scan.documents[0].docDate, '9.9.2026');
+  // קריאה זולה נבחרה כי הנייר שלה נסגר טוב יותר; ההכרעה היא עדה לתאריך שלה —
+  // או חולקת עליו יחד עם הקריאה הזולה השנייה.
+  const strongWorse = docDate => answer(doc({ ...shiftedCodes, subtotalExVat: 79, docDate }));
+  const witnessed = await request([answer(dated(shiftedCodes, '7.9.2026')), answer(dated(shiftedCodesOther, '1.9.2026')), strongWorse('7.9.2026')]);
+  assert.equal(witnessed.output.consensus.escalationSelected, false);
+  assert.equal(witnessed.output.scan.documents[0].docDate, '7.9.2026');
+  assert.deepEqual(witnessed.output.consensus.docDateUnconfirmed, []);
+  const outvoted = await request([answer(dated(shiftedCodes, '7.9.2026')), answer(dated(shiftedCodesOther, '1.9.2026')), strongWorse('1.9.2026')]);
+  assert.equal(outvoted.output.consensus.escalationSelected, false);
+  assert.equal(outvoted.output.scan.documents[0].docDate, '7.9.2026');
+  assert.deepEqual(outvoted.output.consensus.docDateUnconfirmed, [0]);
+});
+
+test('v17: a checksum retry that wins with its own date is measured against both cheap reads', async () => {
+  // שתי הקריאות הזולות הסכימו על נייר שאינו נסגר ועל התאריך; קריאת ההצלה ניצחה עם תאריך אחר.
+  const { output, calls } = await request([...agreed(doc({ subtotalExVat: 49 })), answer(doc({ docDate: '1.9.2026' }))]);
+  assert.equal(calls.length, 3);
+  assert.equal(output.checksumRetryAttempted, true);
+  assert.equal(output.scan.documents[0].docDate, '1.9.2026');
+  assert.deepEqual(output.consensus.docDateUnconfirmed, [0]);
+  // וכשקריאת ההצלה קראה את אותו תאריך — שתי העדות מאשרות אותו.
+  const same = await request([...agreed(doc({ subtotalExVat: 49 })), answer(doc())]);
+  assert.equal(same.output.checksumRetryAttempted, true);
+  assert.deepEqual(same.output.consensus.docDateUnconfirmed, []);
+});
+
+test('v17: the unconfirmed date is read from the documents, not from the capped diff list', () => {
+  // התעודה הראשונה שונה ב-250 קודים, ולכן diffs נקטע לפני התאריך של התעודה השנייה.
+  const many = prefix => Array.from({ length: 250 }, (unused, index) => row({ code: prefix + index, lineNumber: index + 1 }));
+  const selected = { documents: [doc({ rows: many('A') }), doc({ noteIndex: 1 })], warnings: [] };
+  const other = { documents: [doc({ rows: many('B') }), doc({ noteIndex: 1, docDate: '1.9.2026' })], warnings: [] };
+  const capped = scanConsensusDiff(selected, other);
+  assert.equal(capped.length, 200);
+  assert.ok(!capped.some(diff => diff.field === 'docDate'));
+  assert.deepEqual(scanConsensusDocDateUnconfirmed(selected, [other]), [1]);
+  // עד אחד שמאשר מספיק, גם כשאחר חולק; עד שלא קרא את המסמך אינו מאשר.
+  assert.deepEqual(scanConsensusDocDateUnconfirmed(selected, [other, selected]), []);
+  assert.deepEqual(scanConsensusDocDateUnconfirmed(selected, [{ documents: [doc()], warnings: [] }]), [1]);
+  // בלי עדים אין מי שחולק: זה המקרה של unverifiedSingleRead, לא של התאריך.
+  assert.deepEqual(scanConsensusDocDateUnconfirmed(selected, []), []);
+  assert.deepEqual(scanConsensusDocDateUnconfirmed(selected, [null]), []);
 });
 
 test('v17: money, identity and the promotion star still escalate', async () => {
@@ -695,6 +774,7 @@ test('OPENAI_CONSENSUS_READS=1 restores the single cheap read', async () => {
   assert.equal(calls.length, 1);
   assert.equal(output.ok, true);
   assert.equal(output.consensus.attempted, false);
+  assert.deepEqual(output.consensus.docDateUnconfirmed, []);
   assert.equal(output.scanAudit.attempts[0].stage, 'initial');
 });
 

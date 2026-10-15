@@ -13,6 +13,27 @@ printed net. A difference in them is still returned in `consensus.diffs`,
 marked `trigger: false`, and `consensus.agreed` is computed on the other
 differences only — reads that differ only in the date cost one paid call less.
 
+Because a date difference no longer buys the retry model, a cheap read can be
+selected with a date nobody settled. The owner's decision is that a date that
+was not read well defaults to today. The app uses the printed date only as the
+day prices and promotion validity are checked against, so it needs to know when
+not to trust that date. `consensus.docDateUnconfirmed` lists the `noteIndex` of
+every document where another read read a different date and no other read
+confirms the selected date. "Another read" means the same witnesses as
+`consensus.disputedRows`: every completed cheap read and the retry model's
+read, except the selected one. A checksum-retry read that wins is measured
+against all of them; one that loses is not a witness. Dates are compared the
+way the diff compares them (the string, trimmed), so `7.9.2026` and
+`07.09.2026` count as different. They are compared directly from the
+documents, not taken from `consensus.diffs`, which stops at 200 entries. A read
+that returned no date, or did not return that document, does not confirm.
+The array is always present. It is empty when consensus was not attempted,
+when the dates agree, and for a lone read. A lone read has no witness, so
+nobody read another date, and `consensus.unverifiedSingleRead` already says
+that nothing is confirmed. The service still returns the printed date
+unchanged and escalates, selects and warns exactly as before. The app decides
+which day to use and shows the worker that the day was assumed.
+
 The retry model reads the photo independently. Until service 16 its corrective
 note quoted both earlier values ("read once X and once Y"), and a model handed
 two answers picks between them instead of reading the paper. The note now names
@@ -151,7 +172,10 @@ retry model's decision when the retry model read the other one. App 141 reads
 service 16 omits them, it falls back to their service-16 meaning: a completed
 escalation was selected, and a lone read is derived from `completedReads`,
 `escalated` and the selected attempt. So it is safe against the service that
-is live now. Release app 141, confirm the
+is live now. Service 16 does not send `consensus.docDateUnconfirmed`. There a
+date difference escalates and the retry model's read wins, and the response
+does not say whether that date matched either cheap read. A missing field
+therefore means "unknown", not "confirmed". Release app 141, confirm the
 store devices show version 141, and only then deploy this source to the
 existing `tnuva-ai-scan` service. `/health` must report `serviceVersion:17`,
 `resumableScans:true`, `photoFirst:true`, `scanAuditVersion:1`,
