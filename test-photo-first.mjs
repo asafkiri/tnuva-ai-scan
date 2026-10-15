@@ -126,7 +126,7 @@ test('promo sheets without barcodes match only catalog aliases and preserve the 
   const { output, calls } = await requestPromo([promoRow()]);
   assert.equal(output.ok, true);
   assert.equal(output.promoCatalogMatching, true);
-  assert.equal(output.serviceVersion, 16);
+  assert.equal(output.serviceVersion, 17);
   assert.equal(output.sheet.rows[0].barcode, null);
   assert.equal(output.sheet.rows[0].productId, 'catalog-cheese');
   assert.deepEqual(output.sheet.rows[0].candidateProductIds, ['catalog-cheese']);
@@ -166,6 +166,8 @@ test('normal photo: two parallel Luna reads agree and nothing escalates', async 
   assert.deepEqual(calls.map(call => call.model), ['gpt-5.6-luna', 'gpt-5.6-luna']);
   assert.equal(output.consensus.agreed, true);
   assert.equal(output.consensus.escalated, false);
+  assert.equal(output.consensus.escalationSelected, false);
+  assert.equal(output.consensus.unverifiedSingleRead, false);
   assert.deepEqual(output.consensus.disputedRows, []);
   assert.equal(output.checksumRetryAttempted, false);
   assert.equal(output.paperValidation[0].ok, true);
@@ -362,7 +364,7 @@ test('a row every other read saw and the winning read dropped is named, unless t
   assert.deepEqual(scanConsensusMissingRows(scan(droppedRowPaper), [scan(fourRowPaper), scan(fourRowPaper)], { paperConfirmsRows: () => true }), []);
 });
 
-test('reads that disagree escalate to Terra, and the expensive read wins', async () => {
+test('reads that disagree escalate to Terra, and on a paper tie the expensive read wins', async () => {
   const thirdReading = doc({ ...shiftedCodes, rows: [shiftedCodes.rows[0], row({ ...shiftedCodes.rows[1], code: '333' })] });
   const { output, calls } = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(thirdReading)]);
   assert.equal(calls.length, 3);
@@ -372,11 +374,17 @@ test('reads that disagree escalate to Terra, and the expensive read wins', async
   assert.equal(output.consensus.escalated, true);
   assert.equal(output.consensus.escalationModel, 'gpt-5.6-terra');
   assert.equal(output.scanAudit.attempts[2].stage, 'consensus_escalation');
+  // v17: שלוש הקריאות נסגרות מול הנייר באותה מידה — בשוויון ההכרעה נבחרת.
+  assert.deepEqual(output.scanAudit.attempts.map(a => a.paperError), [0, 0, 0]);
   assert.deepEqual(output.scanAudit.attempts.map(a => a.selected), [false, false, true]);
-  // ההנחיה המתקנת מתארת את ההבדל ואת כשל ההסטה, ואינה מבקשת לבחור בין הקריאות.
-  const corrective = JSON.stringify(calls[2].input);
-  assert.ok(corrective.includes('שורה 2'));
+  assert.equal(output.consensus.escalationSelected, true);
+  assert.equal(output.consensus.unverifiedSingleRead, false);
+  assert.equal(output.model, 'gpt-5.6-terra');
+  // ההנחיה המתקנת מתארת את מקום ההבדל ואת כשל ההסטה, בלי הקודים שנקראו.
+  const corrective = calls[2].input[1].content.at(-1).text;
+  assert.ok(corrective.includes('שורה 2: code.'));
   assert.ok(corrective.includes('עמודת הקוד'));
+  assert.ok(!corrective.includes('222') && !corrective.includes('111'));
   // המודל היקר קרא קוד שלישי שאף קריאה אינה מאשרת — השורה נשארת לאישור ידני.
   assert.equal(output.scan.documents[0].rows[1].code, '333');
   assert.equal(output.consensus.disputedRows.length, 1);
@@ -413,9 +421,12 @@ test('a read that saw one row too many does not put the whole paper in dispute',
   assert.equal(calls.length, 3);
   assert.equal(output.consensus.escalated, true);
   assert.ok(output.consensus.diffs.some(diff => diff.field === 'rowCount'));
-  const corrective = JSON.stringify(calls[2].input);
+  // v17: ההנחיה נותנת את המקום ואת שם השדה — מספר השורות, וקיום השורה שרק קריאה
+  // אחת ראתה — ולא את הקוד או הכמות שנקראו בה.
+  const corrective = calls[2].input[1].content.at(-1).text;
   assert.ok(corrective.includes('מספר השורות'));
-  assert.ok(corrective.includes('נקראה בקריאה אחת בלבד'));
+  assert.ok(corrective.includes('שורה 3: קיום השורה'));
+  assert.ok(!corrective.includes('קוד 222') && !corrective.includes('נקראה בקריאה אחת בלבד'));
   assert.equal(output.paperValidation[0].ok, true);
   assert.deepEqual(output.consensus.disputedRows, []);
   assert.ok(!JSON.stringify(output).includes('"rowCount","selected"'));
@@ -434,9 +445,15 @@ test('a read that saw one row too many does not put the whole paper in dispute',
 test('a row every other read saw and the winning read dropped is named next to the paper gap', async () => {
   // שתי הקריאות הזולות ראו ארבע שורות ונחלקו על כמות; ההסלמה פספסה שורה, וגם
   // קריאת ההצלה של סכום הביקורת — הנייר אינו נסגר, והשורה החסרה נאמרת בשמה.
+  // v17: ההסלמה נבחרת כאן רק כי הקריאות הזולות לא קראו את מונה הפריטים — הנייר
+  // שלהן אינו נבדק כלל. עד שירות 16 היא נבחרה בכל מקרה; עכשיו קריאה זולה
+  // שנסגרת מול הנייר הייתה גוברת עליה (ראה הבדיקה של בחירה לפי הנייר).
+  const unread = item => doc({ ...item, itemsPrintedLines: null });
   const otherQty = doc({ ...fourRowPaper, rows: fourRows().map((item, index) => index === 3 ? row({ ...item, quantity: 2, lineTotalExVat: 6 }) : item) });
-  const { output, calls } = await request([answer(fourRowPaper), answer(otherQty), answer(droppedRowPaper), answer(droppedRowPaper)]);
+  const { output, calls } = await request([answer(unread(fourRowPaper)), answer(unread(otherQty)), answer(droppedRowPaper), answer(droppedRowPaper)]);
   assert.equal(calls.length, 4, 'escalation, then one checksum retry because the paper does not close');
+  assert.equal(output.consensus.escalationSelected, true);
+  assert.deepEqual(output.scanAudit.attempts.map(a => a.selected), [false, false, true, false]);
   assert.equal(output.paperValidation[0].ok, false);
   assert.deepEqual(output.consensus.missingRows.map(item => [item.lineNumber, item.code]), [[3, '333']]);
   assert.ok(output.scan.warnings.some(warning => warning.includes('שורה שהקריאה שנבחרה לא') && warning.includes('קוד 333')));
@@ -451,6 +468,28 @@ test('a read that keeps failing is not a witness: the scan escalates without a s
   assert.equal(output.consensus.completedReads, 1);
   assert.equal(output.consensus.escalated, true);
   assert.equal(output.model, 'gpt-5.6-terra');
+  // קריאת ההכרעה הושלמה, ולכן יש עד לקריאה שנבחרה.
+  assert.equal(output.consensus.unverifiedSingleRead, false);
+  // אין הבדלים להראות: ההנחיה אינה ממציאה מקומות, ועדיין מזהירה מהסטת העמודה.
+  const corrective = calls[3].input[1].content.at(-1).text;
+  assert.ok(corrective.includes('קריאה מקבילה של אותו צילום לא הושלמה'));
+  assert.ok(corrective.includes('עמודת הקוד') && !corrective.includes('נחלקו במקומות'));
+});
+
+test('v17: one cheap read failed and the strong read failed too — the lone read is marked unverified', async () => {
+  // עד שירות 16 זה חזר ok:true בלי מחלוקת ובלי אזהרה: קריאה אחת, בלי עד, שנראתה כמו הסכמה.
+  const drop = () => new Error('test network failure');
+  const { output, calls } = await request([answer(doc()), drop(), drop(), drop()]);
+  assert.equal(calls.length, 4, 'two reads, one network retry, one failed escalation');
+  assert.equal(output.ok, true);
+  assert.equal(output.consensus.reason, 'read_failed');
+  assert.equal(output.consensus.escalated, false);
+  assert.equal(output.consensus.escalationError, 'openai_network_error');
+  assert.equal(output.consensus.unverifiedSingleRead, true);
+  assert.deepEqual(output.consensus.disputedRows, []);
+  assert.ok(output.scan.warnings.some(warning => warning.startsWith('רק קריאה אחת של הצילום הושלמה') && warning.includes('לפני קליטה')));
+  assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected]),
+    [['consensus_1', true], ['consensus_2', false], ['consensus_2_retry', false], ['consensus_escalation', false]]);
 });
 
 test('failed escalation keeps the cheap read and still raises the disputed row', async () => {
@@ -461,6 +500,9 @@ test('failed escalation keeps the cheap read and still raises the disputed row',
   assert.equal(output.consensus.escalationError, 'openai_network_error');
   assert.equal(output.scan.documents[0].rows[1].code, '222', 'the first cheap read stays the answer');
   assert.equal(output.consensus.disputedRows.length, 1);
+  // הקריאה הזולה השנייה היא עד, ולכן זו אינה קריאה בודדת.
+  assert.equal(output.consensus.unverifiedSingleRead, false);
+  assert.equal(output.consensus.escalationSelected, false);
 });
 
 test('both reads failing, twice each, returns the failure and not a half answer', async () => {
@@ -469,6 +511,166 @@ test('both reads failing, twice each, returns the failure and not a half answer'
   assert.equal(calls.length, 4);
   assert.equal(output.ok, false);
   assert.equal(output.error, 'openai_network_error');
+});
+
+// ===== v17: מה מסלים, מה קריאת ההכרעה יודעת, ומי נבחר =====
+test('v17: fields that decide nothing are still reported, marked trigger:false', () => {
+  const other = doc({ docDate: '1.9.2026', vatPct: 17, vatAmount: 8.5, totalInclVat: 58.5, roundingDiff: .02,
+    rows: [row({ promoStar: true, sourcePage: 2 })] });
+  assert.deepEqual(scanConsensusDiff(scan(doc()), scan(other)).map(diff => [diff.field, diff.trigger ?? true]), [
+    ['docDate', false], ['vatPct', false], ['vatAmount', false], ['totalInclVat', false], ['roundingDiff', false],
+    ['promoStar', true], ['sourcePage', false]]);
+});
+
+test('v17: a date or a page the reads disagree on costs no escalation', async () => {
+  const { output, calls } = await request([answer(doc()), answer(doc({ docDate: '1.9.2026' }))]);
+  assert.equal(calls.length, 2, 'one paid call fewer than service 16');
+  assert.equal(output.consensus.agreed, true);
+  assert.equal(output.consensus.escalated, false);
+  assert.equal(output.consensus.reason, null);
+  assert.deepEqual(output.consensus.diffs, [{ noteIndex: 0, scope: 'document', field: 'docDate', values: ['7.9.2026', '1.9.2026'], trigger: false }]);
+  assert.deepEqual(output.consensus.disputedRows, []);
+  assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.consensus, a.selected]), [['consensus_1', 'agreed', true], ['consensus_2', 'agreed', false]]);
+  assert.equal(output.scan.documents[0].docDate, '7.9.2026');
+  // שורה שכל קריאה שייכה לעמוד אחר — מידע בלבד אצל הלקוח, ולא הסלמה.
+  const twoPages = [{ ...input[0], pages: [image, image] }];
+  const onPage = page => doc({ pageCount: 2, itemsPrintedLines: 2, subtotalExVat: 80,
+    rows: [row(), row({ code: '9', lineNumber: 2, sourcePage: page, quantity: 6, lineTotalExVat: 30 })] });
+  const paged = await request([answer(onPage(2)), answer(onPage(1))], twoPages);
+  assert.equal(paged.calls.length, 2);
+  assert.equal(paged.output.consensus.agreed, true);
+  assert.deepEqual(paged.output.consensus.diffs.map(diff => [diff.field, diff.rowIndex, diff.trigger]), [['sourcePage', 1, false]]);
+  assert.equal(paged.output.paperValidation[0].ok, true);
+  assert.ok(!paged.output.scan.warnings.length);
+  // וכך גם המע"מ והסכום כולל מע"מ, שהלקוח מציג כאזהרה בלבד.
+  const vat = await request([answer(doc()), answer(doc({ vatAmount: 9.01, totalInclVat: 59.01 }))]);
+  assert.equal(vat.calls.length, 2);
+  assert.equal(vat.output.consensus.agreed, true);
+});
+
+test('v17: money, identity and the promotion star still escalate', async () => {
+  for (const other of [doc({ subtotalExVat: 50.5 }), doc({ promoDiscountExVat: 1 }), doc({ rows: [row({ lineTotalExVat: 50.1 })] }),
+    doc({ rows: [row({ code: '9' })] }), doc({ rows: [row({ promoStar: true })] }), doc({ docDate: '1.9.2026', rows: [row({ quantity: 11 })] })]) {
+    const { output, calls } = await request([answer(doc()), answer(other), answer(doc())]);
+    assert.equal(calls.length, 3, JSON.stringify(other));
+    assert.equal(calls[2].model, 'gpt-5.6-terra');
+    assert.equal(output.consensus.agreed, false);
+    assert.equal(output.consensus.reason, 'reads_disagree');
+    assert.equal(output.consensus.escalated, true);
+  }
+});
+
+test('v17: the strong read gets the places the reads disagreed on, never the values they read', async () => {
+  // הקריאה השנייה קראה בשורה 2 קוד, כמות וסכום אחרים, ולכן גם סיכום אחר — ותאריך אחר.
+  const other = paper(fourRows().map((item, index) => index === 1 ? row({ ...item, code: '229', quantity: 7, lineTotalExVat: 35 }) : item));
+  const { output, calls } = await request([answer(fourRowPaper), answer(doc({ ...other, docDate: '1.9.2026' })), answer(fourRowPaper)]);
+  assert.equal(calls.length, 3);
+  assert.equal(output.consensus.agreed, false);
+  const note = calls[2].input[1].content.at(-1).text;
+  assert.ok(note.includes('מסמך noteIndex=0: subtotalExVat.'), note);
+  assert.ok(note.includes('מסמך noteIndex=0, עמוד 1, שורה 2: code, quantity, lineTotalExVat.'), note);
+  assert.ok(note.includes('באופן עצמאי'));
+  assert.ok(note.includes('עמודת הקוד נקראת בהסטה של שורה אחת'));
+  assert.ok(note.includes('שווה למונה "פריטים" המודפס'));
+  // אף ערך שנקרא: לא הקודים, לא הכמות והסכומים, לא הסיכום, לא התאריך — ולא שדות מידע.
+  for (const value of ['222', '229', '35', '96', '91', '₪', 'נקרא פעם', 'docDate', '1.9.2026', '7.9.2026', 'vatAmount', 'totalInclVat']) {
+    assert.ok(!note.includes(value), value);
+  }
+  // קריאת ההכרעה עצמה רואה את אותם צילומים ואת אותן הנחיות כמו הקריאות הזולות.
+  assert.deepEqual(calls[2].input[0], calls[0].input[0]);
+  assert.deepEqual(calls[2].input[1].content.slice(0, -1), calls[0].input[1].content);
+});
+
+test('v17: a cheap read that closes the paper better is selected, and the strong read becomes its witness', async () => {
+  // ההכרעה קראה את הקוד כמו הקריאה הראשונה, אבל את "סהכ חייב מעמ" בטעות.
+  const strongWorse = doc({ ...shiftedCodes, subtotalExVat: 79 });
+  const { output, calls } = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(strongWorse)]);
+  assert.equal(calls.length, 3, 'the selected read closes the paper, so there is no checksum retry');
+  assert.equal(output.consensus.escalated, true);
+  assert.equal(output.consensus.escalationModel, 'gpt-5.6-terra');
+  assert.equal(output.consensus.escalationSelected, false);
+  assert.equal(output.model, 'gpt-5.6-luna');
+  assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected, a.paperError]),
+    [['consensus_1', true, 0], ['consensus_2', false, 0], ['consensus_escalation', false, 2]]);
+  assert.equal(output.scan.documents[0].subtotalExVat, 80);
+  assert.equal(output.paperValidation[0].ok, true);
+  assert.equal(output.checksumRetryAttempted, false);
+  // הקוד של הקריאה שנבחרה מאושר בידי ההכרעה — היא עדה, לא מנצחת.
+  assert.deepEqual(output.consensus.disputedRows.map(item => [item.rowIndex, item.fields]),
+    [[1, [{ field: 'code', selected: '222', other: '111', confirmed: 1 }]]]);
+  assert.ok(!output.scan.warnings.some(warning => warning.includes('אישור ידני')));
+  assert.equal(output.consensus.unverifiedSingleRead, false);
+});
+
+test('v17: an equal paper error is a tie, and a tie goes to the strong read', async () => {
+  // שלוש הקריאות קראו את אותו סיכום שגוי: הנייר של כולן רחוק באותה מידה.
+  const wrong = value => doc({ ...value, subtotalExVat: 79 });
+  const thirdReading = doc({ ...shiftedCodes, rows: [shiftedCodes.rows[0], row({ ...shiftedCodes.rows[1], code: '333' })] });
+  const { output, calls } = await request([answer(wrong(shiftedCodes)), answer(wrong(shiftedCodesOther)), answer(wrong(thirdReading)), answer(wrong(thirdReading))]);
+  assert.equal(calls.length, 4, 'escalation, then the checksum retry of the selected read');
+  assert.deepEqual(output.scanAudit.attempts.slice(0, 3).map(a => a.paperError), [2, 2, 2]);
+  assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected]),
+    [['consensus_1', false], ['consensus_2', false], ['consensus_escalation', true], ['checksum_retry', false]]);
+  assert.equal(output.consensus.escalationSelected, true);
+  assert.equal(output.scan.documents[0].rows[1].code, '333');
+  assert.equal(output.model, 'gpt-5.6-terra');
+});
+
+test('v17: reads one agora off in opposite directions tie, and the tie still goes to the strong read', async () => {
+  // סיכום מודפס 96.29. ההכרעה קראה 96.28, הקריאה הזולה הראשונה 96.30 — שתיהן
+  // רחוקות אגורה אחת. בשקלים עשרוניים ההפרשים יוצאים 0.01000000000000512
+  // ו-0.009999999999990905, והקריאה הזולה "ניצחה" שוויון. המדד באגורות שלמות.
+  const off = (price, code = '8') => doc({ subtotalExVat: 96.29, rows: [row({ code, quantity: 1, unitPriceExVat: price, lineTotalExVat: price })] });
+  const { output, calls } = await request([answer(off(96.30)), answer(off(96.31, '9')), answer(off(96.28)), answer(off(96.28))]);
+  assert.equal(calls.length, 4, 'escalation, then the checksum retry of the selected read');
+  assert.deepEqual(output.scanAudit.attempts.slice(0, 3).map(a => [a.stage, a.paperError]),
+    [['consensus_1', 1.01], ['consensus_2', 1.02], ['consensus_escalation', 1.01]]);
+  assert.deepEqual(output.scanAudit.attempts.map(a => a.selected), [false, false, true, false]);
+  assert.equal(output.consensus.escalationSelected, true);
+  assert.equal(output.model, 'gpt-5.6-terra');
+  assert.equal(output.scan.documents[0].rows[0].lineTotalExVat, 96.28);
+});
+
+test('v17: with a typed anchor the reads are ranked by the printed paper, not by how close they come to the anchor', async () => {
+  // הוקלדו 95 ו-2 שורות, אבל הנייר: שתי שורות של 50 וסיכום מודפס 100. קריאה זולה
+  // אחת וההכרעה קראו נכון (רחוקות 5 מהעוגן); השנייה קראה 47 בשורה 2 (רחוקה 2 בלבד).
+  // לפי העוגן הקריאה השגויה הייתה נבחרת, עוקפת את עצירת העוגן השגוי ועולה קריאת הצלה.
+  const typed = [{ ...input[0], expectedSubtotalExVat: 95, expectedLines: 2 }];
+  const right = doc({ itemsPrintedLines: 2, subtotalExVat: 100, rows: [row({ code: '111' }), row({ code: '222', lineNumber: 2 })] });
+  const misread = doc({ ...right, rows: [right.rows[0], row({ code: '229', lineNumber: 2, unitPriceExVat: 4.7, lineTotalExVat: 47 })] });
+  const { output, calls } = await request([answer(right), answer(misread), answer(right)], typed);
+  assert.equal(calls.length, 3, 'no checksum retry against a typed anchor the paper disproves');
+  assert.equal(output.ok, false);
+  assert.equal(output.error, 'anchor_mismatch_printed');
+  assert.ok(output.message.includes('₪100.00'), output.message);
+  assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected, a.paperError]),
+    [['consensus_1', false, 0], ['consensus_2', false, 4], ['consensus_escalation', true, 0]]);
+  // ועם עוגן נכון: קריאה זולה שנסגרת מול הנייר גוברת על הכרעה שקראה את הסיכום בטעות,
+  // ומשם הכול כרגיל — העוגן מאושר, אין קריאת הצלה, וההכרעה עדה לקוד שנבחר.
+  const anchored = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(doc({ ...shiftedCodes, subtotalExVat: 79 }))],
+    [{ ...input[0], expectedSubtotalExVat: 80, expectedLines: 2 }]);
+  assert.equal(anchored.calls.length, 3);
+  assert.equal(anchored.output.ok, true);
+  assert.equal(anchored.output.consensus.escalationSelected, false);
+  assert.equal(anchored.output.model, 'gpt-5.6-luna');
+  assert.equal(anchored.output.checksumRetryAttempted, false);
+  assert.deepEqual(anchored.output.scanAudit.attempts.map(a => [a.selected, a.paperError]), [[true, 0], [false, 0], [false, 2]]);
+  assert.deepEqual(anchored.output.consensus.disputedRows.map(item => item.fields), [[{ field: 'code', selected: '222', other: '111', confirmed: 1 }]]);
+});
+
+test('v17: reads that did not read the printed summary tie, instead of the read with fewer rows winning', async () => {
+  // בלי סיכום ובלי מונה מודפסים אין מול מה למדוד את סכום השורות ואת מספרן — אחרת
+  // הקריאה שהשמיטה שורה "קרובה" יותר לאפס ונבחרת.
+  const blind = rows => doc({ itemsPrintedLines: null, subtotalExVat: null, rows });
+  const { output, calls } = await request([answer(blind([row()])), answer(blind([row({ code: '9' })])),
+    answer(blind([row(), row({ code: '7', lineNumber: 2 })]))]);
+  assert.equal(calls.length, 3, 'a missing summary asks for a photo, not a paid reread');
+  assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected]),
+    [['consensus_1', false], ['consensus_2', false], ['consensus_escalation', true]]);
+  assert.equal(new Set(output.scanAudit.attempts.map(a => a.paperError)).size, 1);
+  assert.equal(output.consensus.escalationSelected, true);
+  assert.equal(output.scan.documents[0].rows.length, 2);
+  assert.equal(output.paperValidation[0].missingSummary, true);
 });
 
 // v12: נתק בדרך אל המודל אינו תשובה — הקריאה שנפלה מהר מנסה שוב פעם אחת.
@@ -602,7 +804,7 @@ test('a key the instance never saw says so, so the client knows to send the phot
   const output = await sendScan(server, { scanKey: 'no-such-key-01', resume: true }).ended;
   assert.equal(output.ok, false);
   assert.equal(output.error, 'resume_unknown');
-  assert.equal(output.serviceVersion, 16);
+  assert.equal(output.serviceVersion, 17);
   assert.equal(calls.length, 0);
   server.close();
 });

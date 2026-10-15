@@ -62,7 +62,7 @@ const OPENAI_TIMEOUT_MS = 180_000;
 export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 16; // Promo matching rejects different flavors, including same-price substitutes.
+const SERVICE_VERSION = 17; // Consensus escalates only on decision fields; the strong read is independent and must beat the paper.
 // v13: עבודת סריקה נשמרת חצי שעה אחרי שהסתיימה, ושעה לכל היותר מרגע שנפתחה.
 // זה מכסה בנוחות טלפון שנפל וחוזר, ואינו מחזיק זיכרון מעבר לכך.
 const SCAN_JOB_TTL_MS = 30 * 60 * 1000;
@@ -496,8 +496,18 @@ export function scanChecksumMismatches(scan, inputDocuments) {
   return out;
 }
 
+// v17: המדד נספר באגורות שלמות. בשקלים עשרוניים שתי קריאות שרחוקות מהנייר אותו
+// מספר אגורות יצאו "שונות" ברעש של נקודה צפה (0.0100000000005 מול
+// 0.0099999999999), והשוויון — שבו קריאת ההכרעה אמורה לגבור — הוכרע בהגרלה.
+// שקל של פער, שורה מול המונה וכל בעיה אחרת בנייר שווים 100 כל אחד, באותו יחס
+// כמו עד כה. מסמך שסיכומו המודפס לא נקרא נספר בקנס קבוע ובבעיותיו בלבד: אין
+// מול מה למדוד את סכום השורות ואת מספרן, ובלעדי זה הקריאה שהשמיטה שורות הייתה
+// "קרובה" יותר לאפס. קריאת ההצלה אינה מושפעת מזה — קריאה שאיבדה את הסיכום
+// אינה נבחרת שם ממילא.
 function checksumTotalError(mismatches) {
-  return (mismatches || []).reduce((total, item) => total + Math.abs(item.got - item.expected) + Math.abs((item.gotLines || 0) - (item.expectedLines || 0)) + (item.problems || []).length + (item.missingSummary ? 1000000 : 0), 0);
+  return (mismatches || []).reduce((total, item) => total + 100 * (item.problems || []).length + (item.missingSummary
+    ? 100_000_000
+    : Math.round(Math.abs(item.got - item.expected) * 100) + 100 * Math.abs((item.gotLines || 0) - (item.expectedLines || 0))), 0);
 }
 
 // ===== v11: קונצנזוס שתי קריאות =====
@@ -512,6 +522,13 @@ const CONSENSUS_ROW_FIELDS = ["section", "code", "quantity", "unitPriceExVat", "
 const CONSENSUS_DOC_FIELDS = ["docNumber", "docDate", "docType", "pageCount", "vatPct", "itemsSectionTotalExVat",
   "promoDiscountExVat", "itemsPrintedLines", "returnsSectionTotalExVat", "returnsPrintedLines", "subtotalExVat",
   "vatAmount", "totalInclVat", "roundingDiff"];
+// v17: לא כל הבדל בין הקריאות שווה קריאה במודל היקר. תאריך המסמך אינו משנה
+// לבעל החנות (הכרעתו), והעמוד הוא מידע בלבד אצל הלקוח. אחוז המע"מ, סכום
+// המע"מ, הסכום כולל מע"מ והפרש העיגול משמשים בלקוח לאזהרה ולרמז תצוגה בלבד —
+// החישובים נשענים על הגדרת האפליקציה ועל הנטו המודפס. הבדל בשדות האלה נמסר
+// ב-diffs עם trigger:false ואינו מסלים. הכוכבית נשארת: הלקוח משייך לפיה מוצר
+// בין תאומים במחיר, ומכריע לפיה מבצע שחסר במאגר.
+const CONSENSUS_INFORMATIONAL_FIELDS = new Set(["docDate", "sourcePage", "vatPct", "vatAmount", "totalInclVat", "roundingDiff"]);
 const CONSENSUS_MONEY_FIELDS = new Set(["unitPriceExVat", "lineTotalExVat", "itemsSectionTotalExVat", "promoDiscountExVat",
   "returnsSectionTotalExVat", "subtotalExVat", "vatAmount", "totalInclVat", "roundingDiff"]);
 const MAX_CONSENSUS_DIFFS = 200;
@@ -527,12 +544,6 @@ function consensusValue(field, value) {
     return Number.isFinite(Number(value)) ? Number(value) : null;
   }
   return String(value).trim();
-}
-function consensusDisplay(field, value) {
-  if (value === undefined || value === null) return "לא נקרא";
-  if (field === "promoStar") return value === true ? "כוכבית" : "ללא כוכבית";
-  if (CONSENSUS_MONEY_FIELDS.has(field)) return Number.isFinite(Number(value)) ? `₪${Number(value).toFixed(2)}` : "לא נקרא";
-  return String(value).trim() || "לא נקרא";
 }
 // ===== v14: השורות מושוות לפי תוכנן, לא לפי מיקומן =====
 // עד שירות 13 שורה i של קריאה אחת הושוותה לשורה i של הקריאה השנייה, ומסמך
@@ -607,6 +618,8 @@ export function alignConsensusRows(rowsA, rowsB) {
 // כל ההבדלים בין שתי קריאות של אותו צילום. rowIndex הוא מיקום השורה בקריאה
 // הראשונה (זו שנבחרה, כשמשווים מולה), otherRowIndex — בשנייה; שורה שרק צד
 // אחד ראה מקבלת null בצד השני והבדל בשדה "row".
+// v17: הבדל בשדה מידע מסומן trigger:false — הוא נמסר, אבל אינו מסלים.
+const consensusTrigger = field => CONSENSUS_INFORMATIONAL_FIELDS.has(field) ? { trigger: false } : {};
 function consensusDiffAll(first, second) {
   const out = [];
   const docsA = (first && first.documents) || [], docsB = (second && second.documents) || [];
@@ -617,7 +630,7 @@ function consensusDiffAll(first, second) {
     if (!a || !b) { out.push({ noteIndex, scope: "document", field: "document", values: [a ? "נקרא" : null, b ? "נקרא" : null] }); continue; }
     for (const field of CONSENSUS_DOC_FIELDS) {
       if (consensusValue(field, a[field]) !== consensusValue(field, b[field])) {
-        out.push({ noteIndex, scope: "document", field, values: [a[field] ?? null, b[field] ?? null] });
+        out.push({ noteIndex, scope: "document", field, values: [a[field] ?? null, b[field] ?? null], ...consensusTrigger(field) });
       }
     }
     const rowsA = Array.isArray(a.rows) ? a.rows : [], rowsB = Array.isArray(b.rows) ? b.rows : [];
@@ -634,7 +647,7 @@ function consensusDiffAll(first, second) {
       const lineNumber = Number(rowA.lineNumber) || pair.a + 1;
       for (const field of CONSENSUS_ROW_FIELDS) {
         if (consensusValue(field, rowA[field]) !== consensusValue(field, rowB[field])) {
-          out.push({ noteIndex, scope: "row", rowIndex: pair.a, otherRowIndex: pair.b, lineNumber, field, values: [rowA[field] ?? null, rowB[field] ?? null] });
+          out.push({ noteIndex, scope: "row", rowIndex: pair.a, otherRowIndex: pair.b, lineNumber, field, values: [rowA[field] ?? null, rowB[field] ?? null], ...consensusTrigger(field) });
         }
       }
     }
@@ -747,15 +760,36 @@ export function scanConsensusMissingRows(selected, others, options = {}) {
     .map(({ reads: unused, ...entry }) => entry)
     .sort((a, b) => a.noteIndex - b.noteIndex || a.lineNumber - b.lineNumber);
 }
-function consensusCorrectiveText(diffs) {
-  const label = field => field === "rowCount" ? "מספר השורות" : field;
-  const parts = (diffs || []).slice(0, MAX_CONSENSUS_CORRECTIVE_LINES).map(diff => diff.scope === "row"
-    ? (diff.field === "row"
-      ? `מסמך noteIndex=${diff.noteIndex}, שורה ${diff.lineNumber}${diff.code ? ` (קוד ${diff.code})` : ""}: נקראה בקריאה אחת בלבד — ייתכן שפוצלה, הוכפלה, הומצאה או הושמטה.`
-      : `מסמך noteIndex=${diff.noteIndex}, שורה ${diff.lineNumber}: ${diff.field} נקרא פעם ${consensusDisplay(diff.field, diff.values[0])} ופעם ${consensusDisplay(diff.field, diff.values[1])}.`)
-    : `מסמך noteIndex=${diff.noteIndex}: ${label(diff.field)} נקרא פעם ${consensusDisplay(diff.field, diff.values[0])} ופעם ${consensusDisplay(diff.field, diff.values[1])}.`);
-  return `שתי קריאות קודמות של אותו צילום נחלקו: ${parts.join(" ")}` +
-    ` קרא את הנייר מחדש מההתחלה, ואל תבחר בין שתי הקריאות הקודמות — שתיהן עשויות לטעות.` +
+// v17: קריאת ההכרעה קוראת את הצילום בעצמה. עד שירות 16 היא קיבלה את שני
+// הערכים ("נקרא פעם X ופעם Y") — ומודל שמקבל שתי תשובות בוחר ביניהן במקום
+// לקרוא את הנייר, ועד שבוחר בין שתי טעויות אינו עד שלישי. עכשיו היא מקבלת רק
+// את המקום: מסמך, עמוד, מספר שורה ושם השדה, בלי אף ערך שנקרא.
+function consensusCorrectiveText(diffs, reads = []) {
+  const label = field => field === "rowCount" ? "מספר השורות"
+    : field === "row" ? "קיום השורה (ייתכן שפוצלה, הוכפלה, הומצאה או הושמטה)"
+    : field === "document" ? "המסמך כולו" : field;
+  const pageOf = diff => {
+    const fromFirst = diff.rowIndex !== null && diff.rowIndex !== undefined;
+    const read = reads[fromFirst ? 0 : 1];
+    const doc = ((read && read.documents) || []).find(item => Number(item && item.noteIndex) === diff.noteIndex);
+    const row = doc && Array.isArray(doc.rows) ? doc.rows[fromFirst ? diff.rowIndex : diff.otherRowIndex] : null;
+    return row && Number.isInteger(row.sourcePage) ? row.sourcePage : null;
+  };
+  const places = new Map();
+  for (const diff of diffs || []) {
+    const page = diff.scope === "row" ? pageOf(diff) : null;
+    const where = diff.scope === "row"
+      ? `מסמך noteIndex=${diff.noteIndex}${page ? `, עמוד ${page}` : ""}, שורה ${diff.lineNumber}`
+      : `מסמך noteIndex=${diff.noteIndex}`;
+    if (!places.has(where)) places.set(where, []);
+    if (!places.get(where).includes(label(diff.field))) places.get(where).push(label(diff.field));
+  }
+  const parts = [...places].slice(0, MAX_CONSENSUS_CORRECTIVE_LINES).map(([where, fields]) => `${where}: ${fields.join(", ")}.`);
+  if (places.size > parts.length) parts.push(`ועוד ${places.size - parts.length} מקומות.`);
+  return (parts.length
+    ? `שתי קריאות קודמות של אותו צילום נחלקו במקומות האלה: ${parts.join(" ")}` +
+      ` הערכים שנקראו אינם נמסרים לך בכוונה: קרא את הצילום באופן עצמאי, מההתחלה ועד הסוף, כאילו לא נקרא מעולם — שתי הקריאות הקודמות עשויות לטעות. המקומות שלמעלה הם רק המקומות שבהם כדאי להאט ולבדוק פעמיים.`
+    : `קריאה מקבילה של אותו צילום לא הושלמה, ואין קריאה שנייה להשוות אליה. קרא את הצילום באופן עצמאי, מההתחלה ועד הסוף.`) +
     ` כשל ידוע בנייר הזה: עמודת הקוד נקראת בהסטה של שורה אחת, כך שקוד של שורה אחת נדבק לכמות ולמחיר של השורה שאחריה.` +
     ` לכן ודא לכל שורה שהקוד, התיאור, הכמות, המחיר והסכום נקראו כולם מאותה שורה אופקית בטבלה, ושמספר השורות שקראת שווה למונה "פריטים" המודפס.` +
     ` קוד שאינו קריא בביטחון — החזר null לאותה שורה בלבד, ואל תזיז בגללו את שאר העמודה.`;
@@ -1978,29 +2012,47 @@ function decodeAnalyzeClaims(result, aliasToId) {
       }
       const consensus = { attempted: consensusReads > 1, reads: consensusReads, completedReads: goodReads.length,
         model: openaiModel, agreed: null, escalated: false, escalationModel: null, escalationError: null,
+        escalationSelected: false, unverifiedSingleRead: false,
         reason: null, diffs: [], disputedRows: [], missingRows: [] };
       let attempt = goodReads[0];
       let escalationRead = null; // v14: גם קריאת ההסלמה היא עדה, אם קריאת ההצלה החליפה אותה אחר כך
       if (consensusReads > 1) {
+        let triggers = [];
         if (goodReads.length < consensusReads) {
           // קריאה שנפלה אינה עד. בלי דעה שנייה אין אישור, ולכן מסלימים.
           consensus.agreed = false;
           consensus.reason = 'read_failed';
         } else {
-          consensus.diffs = scanConsensusDiff(goodReads[0].scan, goodReads[1].scan);
-          consensus.agreed = consensus.diffs.length === 0;
+          // v17: ההסכמה נמדדת על השדות שמשנים החלטה. הבדל בשדה מידע בלבד נמסר
+          // ב-diffs (trigger:false) ואינו עולה קריאה במודל היקר.
+          const diffs = consensusDiffAll(goodReads[0].scan, goodReads[1].scan);
+          triggers = diffs.filter(diff => diff.trigger !== false);
+          consensus.diffs = diffs.slice(0, MAX_CONSENSUS_DIFFS);
+          consensus.agreed = triggers.length === 0;
           if (!consensus.agreed) consensus.reason = 'reads_disagree';
         }
         for (const read of goodReads) read.audit.consensus = consensus.agreed ? 'agreed' : 'disputed';
         if (!consensus.agreed) {
-          const escalation = await attemptScan(consensusCorrectiveText(consensus.diffs), CHECKSUM_RETRY_REASONING_EFFORT, true, 'consensus_escalation');
+          const escalation = await attemptScan(consensusCorrectiveText(triggers, goodReads.map(read => read.scan)),
+            CHECKSUM_RETRY_REASONING_EFFORT, true, 'consensus_escalation');
           if (escalation.fail) {
             consensus.escalationError = escalation.fail.body && escalation.fail.body.error || 'escalation_failed';
           } else {
             consensus.escalated = true;
             consensus.escalationModel = escalation.audit.requestedModel;
-            attempt = escalation;
             escalationRead = escalation;
+            // v17: קריאת ההכרעה אינה מנצחת מעצם היותה יקרה. נבחרת הקריאה שהנייר
+            // שלה נסגר הכי טוב — המדד שבו קריאת ההצלה של סכום הביקורת משווה
+            // קריאות, באגורות שלמות — ובשוויון קריאת ההכרעה. השאר, כולל קריאת
+            // ההכרעה, נשארים עדים. המדידה היא תמיד מול הנייר המודפס, גם כשהוקלד
+            // עוגן: עוגן שגוי היה מעדיף קריאה שגויה שקרובה אליו, עוקף את העצירה
+            // "הנייר סותר את מה שהוקלד" ועולה קריאת הצלה. העוגן נבדק אחר כך מול
+            // הקריאה שנבחרה, כמו תמיד.
+            const paperOnly = documents.map(item => ({ ...item, expectedSubtotalExVat: null, expectedLines: null }));
+            const candidates = [escalation, ...goodReads];
+            const paperError = new Map(candidates.map(read => [read, checksumTotalError(scanChecksumMismatches(read.scan, paperOnly))]));
+            for (const read of candidates) read.audit.paperError = paperError.get(read) / 100; // בשקלים, ליומן
+            attempt = candidates.reduce((best, read) => paperError.get(read) < paperError.get(best) ? read : best);
           }
         }
       }
@@ -2083,10 +2135,11 @@ function decodeAnalyzeClaims(result, aliasToId) {
       // של סכום הביקורת החליפה אותה אחרי ההסלמה, וגם כשהיא החליפה שתי קריאות
       // זולות שהסכימו ביניהן: קריאה שנבחרה ואינה אחת הקריאות שהסכימו נמדדת מול
       // כולן. מסמך שנסגר מול הנייר (מונה הפריטים והסיכום המודפסים) מאשר
-      // בעצמו את מספר שורותיו.
+      // בעצמו את מספר שורותיו. v17: כשקריאה זולה נבחרה אחרי ההסלמה, קריאת
+      // ההכרעה היא אחת העדות שמולן היא נמדדת.
+      const witnesses = goodReads.map(read => read.scan).concat(escalationRead ? [escalationRead.scan] : []).filter(value => value !== scan);
       if (consensus.attempted && (consensus.agreed === false || !goodReads.some(read => read.scan === scan))) {
         const paperOk = new Map(paperChecks(scan).map(check => [Number(check.noteIndex), check.ok === true]));
-        const witnesses = goodReads.map(read => read.scan).concat(escalationRead ? [escalationRead.scan] : []).filter(value => value !== scan);
         const options = { paperConfirmsRows: noteIndex => paperOk.get(Number(noteIndex)) === true };
         consensus.disputedRows = scanConsensusDisputedRows(scan, witnesses, options);
         consensus.missingRows = scanConsensusMissingRows(scan, witnesses, options);
@@ -2104,6 +2157,15 @@ function decodeAnalyzeClaims(result, aliasToId) {
           if (!scan.warnings.includes(warning)) scan.warnings.push(warning);
         }
       }
+      // v17: קריאה אחת בלי אף עד אינה קריאה מאומתת. כשהקריאה המקבילה נפלה וגם
+      // קריאת ההכרעה לא הושלמה, אין מחלוקת — כי אין עם מי לחלוק — וזה בדיוק
+      // מה שאסור להיראות כמו הסכמה.
+      if (consensus.attempted && !witnesses.length) {
+        consensus.unverifiedSingleRead = true;
+        const warning = `רק קריאה אחת של הצילום הושלמה — הקריאה המקבילה וקריאת ההכרעה נכשלו, ולכן אף קריאה אחרת אינה מאשרת את הקודים, הכמויות והסכומים. בדוק את השורות מול הנייר לפני קליטה.`;
+        if (!scan.warnings.includes(warning)) scan.warnings.push(warning);
+      }
+      consensus.escalationSelected = escalationRead !== null && escalationRead.scan === scan;
 
       finishScan({
         ok: true,
