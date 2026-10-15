@@ -414,7 +414,8 @@ export function tnuvaPaperCheck(input, pageCount) {
   // The numbers themselves, not only the fact that they differ. The bare
   // sentence left the user with nothing to compare against the paper.
   const shekels = value => '₪' + (value / 100).toFixed(2);
-  if (expected != null && net !== expected) problems.push('החשבון לא נסגר: שורות הפריטים ' + shekels(itemsCents) +
+  // מינוס שהוא מהחזרות גדולות מהסחורה נסגר בסימן שלו; מינוס של זיכוי — בערך מוחלט.
+  if (expected != null && net !== expected && !(minusSummary && net === subtotal)) problems.push('החשבון לא נסגר: שורות הפריטים ' + shekels(itemsCents) +
     (promo ? ' פחות הנחה ' + shekels(promo) : '') + (returnsCents ? ' פחות החזרות ' + shekels(returnsCents) : '') +
     ' = ' + shekels(net) + ', אבל "סהכ חייב מעמ" נקרא ' + shekels(expected) + ' (הפרש ' + shekels(Math.abs(net - expected)) + ')');
   // שירות 17 (כמו אפליקציה 141): ראש התעודה אינו תנאי לקליטה. רק זיכוי שזוהה

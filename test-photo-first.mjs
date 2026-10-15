@@ -62,6 +62,12 @@ test('service 17: a credit note whose title was cut is stopped by its minus sign
   const partial = tnuvaPaperCheck(doc({ itemsSectionTotalExVat: -50, vatAmount: -9, totalInclVat: -59 }), 1);
   assert.equal(partial.ok, true); assert.equal(partial.receivable, false);
   assert.equal(tnuvaPaperCheck(doc({ roundingDiff: -0.03 }), 1).receivable, true, 'a negative rounding line is normal');
+  // A mixed paper whose returns exceed its goods closes with its own sign: no paid retry.
+  const mixed = doc({ itemsSectionTotalExVat: 50, returnsSectionTotalExVat: 80, returnsPrintedLines: 1, subtotalExVat: -30, vatAmount: -5.4, totalInclVat: -35.4,
+    rows: [row(), row({ section: 'returns', quantity: 16, lineTotalExVat: 80 })] });
+  const mixedCheck = tnuvaPaperCheck(mixed, 1);
+  assert.equal(mixedCheck.ok, true); assert.equal(mixedCheck.receivable, false); assert.equal(mixedCheck.retryable, false);
+  assert.deepEqual(scanChecksumMismatches(scan(mixed), input), []);
 });
 test('crates remain normal products; deposit money counts without becoming product units', () => {
   const d=doc({ subtotalExVat: 63.05, itemsPrintedLines: 3, rows: [row(),
