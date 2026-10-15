@@ -42,6 +42,21 @@ already disagreed with that read on every open field. Two strong reads that
 disagree confirm nothing, so no extra read is bought. Apart from that, the rule
 does not depend on the flag: it only removes disputes.
 
+**Terra#2 votes only on the printed row it was asked about.** Its vote comes
+from its row that the consensus alignment pairs with the selected row: by
+position when both reads have the same number of rows, by content otherwise.
+When Terra#2 skips the asked row, either way can pair a neighbouring row with
+it. If Terra swapped two same-price twins, Terra#2's correct read of the
+neighbour then equals Terra's wrong value in the asked row, and the field would
+close on a row Terra#2 never read. The paper and each row's arithmetic still
+close, so C1 cannot catch it. The vote therefore counts only when the paired
+row carries exactly the selected row's code, and that code appears on only one
+row of the document in both the selected read and Terra#2. A row with no code
+read, a different code, or a code printed on two rows gets `not_seen`, with
+`value: null` in `reads`, and the field goes to the worker. The code only
+identifies the row here. It is not decided or reported, and Terra#2 is still
+not a witness for a code.
+
 **The slot.** Terra#2 shares the checksum-retry slot, so a scan still makes at
 most four model calls and the worst-case wait does not grow:
 
@@ -101,8 +116,10 @@ hold:
   `rowIndex`, `page`, `lineNumber`, `field` and the selected `value`, and it
   carries `rule: "second_strong_read"`. It also lists what every read saw under
   `reads` (`{stage, value}`, with `seen: false` for a read that did not see the
-  row). `open` lists the fields that were asked about and left for the worker,
-  with `reason` set to `disagrees`, `not_seen` or `failed`. The extra call is
+  row). For Terra#2, "did not see the row" includes a paired row that is not
+  the same printed row (see above). `open` lists the fields that were asked
+  about and left for the worker, with `reason` set to `disagrees`, `not_seen` or
+  `failed`. The extra call is
   an ordinary attempt in `scanAudit.attempts`, with its usage, and its usage is
   also in the record's `usage`, which the log line prints in full.
 - **C5, kill switch.** `SECOND_STRONG_READ=off` (also `false` or `0`) restores

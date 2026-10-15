@@ -917,7 +917,8 @@ function consensusCorrectiveText(diffs, reads = []) {
 //      שהזהות שלה פתוחה (ראו scanSecondStrongOpenFields).
 // C3 — ההנחיה נותנת רק מקומות ואת הכשל הידוע, אף פעם לא ערך שנקרא; המודל החזק, מאמץ גבוה.
 // C4 — כל שדה שנסגר כך נרשם ב-consensus.secondStrongRead וביומן invoice_scan_audit,
-//      עם הערך שכל קריאה ראתה.
+//      עם הערך שכל קריאה ראתה. הקול של הקריאה השנייה נספר רק על השורה המודפסת שנשאלה —
+//      אותו קוד, שמופיע פעם אחת בתעודה (secondStrongSameRow); אחרת הוא not_seen.
 // C5 — SECOND_STRONG_READ=off מחזיר את שירות 18 כפי שהיה.
 const SECOND_STRONG_FIELDS = new Set(["quantity", "unitPriceExVat", "lineTotalExVat"]);
 const SECOND_STRONG_RULE = "second_strong_read";
@@ -997,13 +998,32 @@ function consensusFieldReader(selected, other) {
     return diff ? { seen: true, agrees: false, value: diff.values[1] ?? null } : { seen: true, agrees: true, value: selectedValue };
   };
 }
+// מהביקורת: הקול של הקריאה השנייה נלקח מהשורה שלה שמיושרת מול השורה שנבחרה — לפי מיקום
+// כשמספר השורות שווה, ולפי תוכן כשאינו שווה. קריאה שדילגה על השורה שנשאלה מיושרת כך מול
+// שורה שכנה, וכש-Terra החליף בין שני תאומים באותו מחיר, מה שקראה בשורה השכנה נראה כהסכמה על
+// השורה שלא קראה — והרשומה של C4 מייחסת לה ערך שלא קראה שם. לכן הקול נספר רק כשהשורה
+// המיושרת היא אותה שורה מודפסת: אותו קוד בדיוק, וקוד שמופיע פעם אחת בלבד בתעודה, גם בקריאה
+// שנבחרה וגם בקריאה השנייה (שתי שורות באותו קוד — הקוד אינו אומר איזו מהן נקראה). אחרת
+// הקול הוא not_seen, והשדה אצל העובד. הקוד כאן רק מזהה את השורה: הוא אינו מוכרע ואינו נמסר.
+function secondStrongSameRow(selected, other) {
+  const alignedRow = consensusAlignedRows(selected, other);
+  const codeOf = row => consensusValue("code", row && row.code) || null;
+  const docOf = (read, noteIndex) => ((read && read.documents) || []).find(item => Number(item && item.noteIndex) === Number(noteIndex));
+  const once = (doc, code) => (Array.isArray(doc && doc.rows) ? doc.rows : []).filter(item => codeOf(item) === code).length === 1;
+  return (noteIndex, rowIndex) => {
+    const doc = docOf(selected, noteIndex), otherRow = alignedRow(noteIndex, rowIndex);
+    const code = codeOf(doc && Array.isArray(doc.rows) ? doc.rows[rowIndex] : null);
+    return code !== null && codeOf(otherRow) === code && once(doc, code) && once(docOf(other, noteIndex), code);
+  };
+}
 // הספירה: לכל שדה פתוח — הערך שכל קריאה ראתה, ואם הקריאה החזקה השנייה קראה בדיוק
-// את הערך שנבחר, השדה נסגר בכלל second_strong_read. extra=null — הקריאה נכשלה, ושום
-// דבר אינו נסגר. selected, witnesses ו-extra הם {stage, scan}.
+// את הערך שנבחר, באותה שורה מודפסת (secondStrongSameRow), השדה נסגר בכלל second_strong_read.
+// extra=null — הקריאה נכשלה, ושום דבר אינו נסגר. selected, witnesses ו-extra הם {stage, scan}.
 export function scanSecondStrongReadVotes(selected, witnesses, extra, places) {
   const docs = (selected && selected.scan && selected.scan.documents) || [];
   const readers = (witnesses || []).filter(Boolean).map(item => ({ stage: item.stage, read: consensusFieldReader(selected.scan, item.scan) }));
   const extraRead = extra && extra.scan ? consensusFieldReader(selected.scan, extra.scan) : null;
+  const extraSameRow = extra && extra.scan ? secondStrongSameRow(selected.scan, extra.scan) : null;
   const closed = [], open = [];
   for (const place of places || []) {
     const doc = docs.find(item => Number(item && item.noteIndex) === place.noteIndex);
@@ -1012,7 +1032,8 @@ export function scanSecondStrongReadVotes(selected, witnesses, extra, places) {
     const seen = (stage, vote) => ({ stage, value: vote.value, ...(vote.seen ? {} : { seen: false }) });
     const reads = [{ stage: selected.stage, value, selected: true }]
       .concat(readers.map(item => seen(item.stage, item.read(place.noteIndex, place.rowIndex, place.field, value))));
-    const vote = extraRead ? extraRead(place.noteIndex, place.rowIndex, place.field, value) : null;
+    let vote = extraRead ? extraRead(place.noteIndex, place.rowIndex, place.field, value) : null;
+    if (vote && vote.seen && !extraSameRow(place.noteIndex, place.rowIndex)) vote = { seen: false, agrees: false, value: null };
     if (vote) reads.push(seen(extra.stage, vote));
     const entry = { ...place, value, reads };
     if (vote && vote.agrees && row) closed.push({ ...entry, rule: SECOND_STRONG_RULE });

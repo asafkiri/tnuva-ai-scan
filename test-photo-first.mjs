@@ -1465,6 +1465,74 @@ test('v19: the second strong read seconds Terra only — when the paper selected
   assert.deepEqual(votes(null).open.map(item => item.reason), ['failed', 'failed']);
 });
 
+// ===== v19, מהביקורת: הקריאה השנייה מצביעה רק על השורה המודפסת שנשאלה =====
+// הקול של הקריאה השנייה נלקח מהשורה שלה שמיושרת מול השורה של Terra — לפי מיקום כשמספר
+// השורות שווה, ולפי תוכן כשאינו שווה. קריאה שנייה שדילגה על השורה שנשאלה מיושרת כך מול
+// שורה שכנה באותו מחיר, וקראה בה בדיוק את מה ש-Terra שם בשורה שנשאלה — כש-Terra החליף
+// בין שני תאומים. היא מעולם לא ראתה את השורה, והשדה נשאר לעובד.
+test('v19: the second strong read votes only on the printed row it was asked about — a neighbouring same-price row it read instead confirms nothing', async () => {
+  // הנייר: ארבע שורות, 98.11 ₪. בשורות 2 ו-3 שני תאומים ב-3.47: 7 יחידות (24.29) ו-6 (20.82).
+  const twins = (codes = ['14761056', '14761414']) => [row({ code: '111', lineNumber: 1 }),
+    row({ code: codes[0], lineNumber: 2, quantity: 7, unitPriceExVat: 3.47, lineTotalExVat: 24.29 }),
+    row({ code: codes[1], lineNumber: 3, quantity: 6, unitPriceExVat: 3.47, lineTotalExVat: 20.82 }),
+    row({ code: '444', lineNumber: 4, quantity: 1, unitPriceExVat: 3, lineTotalExVat: 3 })];
+  const printed = paper(twins());
+  const read = (rows, codes) => doc({ ...printed, rows: rows(twins(codes)) });
+  // הזולות נחלקו על שורה 2 (8 ו-9) וקראו את שורה 3 נכון. Terra החליף בין התאומים: הנייר שלו
+  // והחשבון של כל שורה עדיין נסגרים, והקוד של כל שורה מאושר בשתי הזולות.
+  const cheap = (quantity, codes) => read(rows => rows.map((item, index) => index === 1 ? { ...item, quantity, lineTotalExVat: Math.round(quantity * 347) / 100 } : item), codes);
+  const swapped = codes => read(rows => rows.map((item, index) => index === 1 ? { ...item, quantity: 6, lineTotalExVat: 20.82 }
+    : index === 2 ? { ...item, quantity: 7, lineTotalExVat: 24.29 } : item), codes);
+  assert.equal(tnuvaPaperCheck(swapped(), 1).receivable, true);
+  // הקריאה השנייה דילגה על שורה 2: שלוש שורות (יישור לפי תוכן), או ארבע כששורה 4 נקראה
+  // פעמיים (יישור לפי מיקום). בשני המקרים שורה 2 של Terra מיושרת מול שורה 3 המודפסת.
+  const skipped = codes => read(rows => rows.filter((item, index) => index !== 1), codes);
+  const skippedTwiceFour = read(rows => [rows[0], rows[2], rows[3], { ...rows[3], lineNumber: 5 }]);
+  for (const [extra, label] of [[skipped(), 'three rows'], [skippedTwiceFour, 'four rows']]) {
+    assert.ok(!extra.rows.some(item => item.code === '14761056'), label);
+    assert.equal(tnuvaPaperCheck(extra, 1).ok, false, label);
+    const responses = () => [answer(cheap(8)), answer(cheap(9)), answer(swapped())];
+    const dark = await request(responses(), input, SECOND_OFF, APP_142);
+    const lit = await request([...responses(), answer(extra)], input, {}, APP_142);
+    assert.equal(lit.calls.length, 4, label);
+    assert.equal(lit.output.consensus.escalationSelected, true, label);
+    // שירות 18: שורה 2 (6 מול 8) ושורה 3 (7 מול 6) אצל העובד. כך גם כאן.
+    assert.deepEqual(dark.output.consensus.disputedRows.map(item => item.lineNumber), [2, 3], label);
+    assert.deepEqual(lit.output.consensus.disputedRows, dark.output.consensus.disputedRows, label);
+    assert.deepEqual(lit.output.scan, dark.output.scan, label);
+    const record = lit.output.consensus.secondStrongRead;
+    assert.deepEqual(record.closed, [], label);
+    // C4: הרשומה אינה מייחסת לקריאה השנייה ערך שלא קראה בשורה 2.
+    assert.deepEqual(record.open.map(item => [item.lineNumber, item.field, item.reason, item.reads.at(-1)]), [
+      [2, 'quantity', 'not_seen', { stage: 'second_strong_read', value: null, seen: false }],
+      [2, 'lineTotalExVat', 'not_seen', { stage: 'second_strong_read', value: null, seen: false }]], label);
+  }
+  // אותו קוד בשתי השורות: הקוד אינו אומר איזו שורה מודפסת הקריאה השנייה קראה, ולכן הוא אינו
+  // מזהה את השורה — לא נספר, גם כשהשורה המיושרת נושאת אותו קוד.
+  const same = ['222', '222'];
+  const places = scanSecondStrongOpenFields(scan(swapped(same)), [scan(cheap(8, same)), scan(cheap(9, same))], input);
+  assert.deepEqual(places.map(item => [item.lineNumber, item.field]), [[2, 'quantity'], [2, 'lineTotalExVat']]);
+  const votes = extra => scanSecondStrongReadVotes({ stage: 'consensus_escalation', scan: scan(swapped(same)) },
+    [{ stage: 'consensus_1', scan: scan(cheap(8, same)) }, { stage: 'consensus_2', scan: scan(cheap(9, same)) }],
+    { stage: 'second_strong_read', scan: scan(extra) }, places);
+  assert.deepEqual(votes(skipped(same)).closed, []);
+  assert.deepEqual(votes(skipped(same)).open.map(item => item.reason), ['not_seen', 'not_seen']);
+  // הקריאה השנייה קראה בשורה 2 קוד אחר מזה של Terra: זו לא אותה שורה בעיניה, והקול אינו נספר.
+  const fourVotes = extra => scanSecondStrongReadVotes({ stage: 'consensus_escalation', scan: scan(fourRowPaper) },
+    [{ stage: 'consensus_1', scan: scan(lunaThirteen) }, { stage: 'consensus_2', scan: scan(lunaSeventeen) }],
+    { stage: 'second_strong_read', scan: scan(extra) },
+    scanSecondStrongOpenFields(scan(fourRowPaper), [scan(lunaThirteen), scan(lunaSeventeen)], input));
+  assert.deepEqual(fourVotes(rowTwo({ code: '229' })).open.map(item => [item.field, item.reason, item.reads.at(-1)]), [
+    ['quantity', 'not_seen', { stage: 'second_strong_read', value: null, seen: false }],
+    ['lineTotalExVat', 'not_seen', { stage: 'second_strong_read', value: null, seen: false }]]);
+  // ושורה אחרת שהקריאה השנייה פספסה אינה משנה דבר: השורה שנשאלה קראה אותה, באותו קוד, והיא נסגרת.
+  assert.deepEqual(fourVotes(droppedRowPaper).closed.map(item => [item.lineNumber, item.field, item.reads.at(-1)]), [
+    [2, 'quantity', { stage: 'second_strong_read', value: 6 }], [2, 'lineTotalExVat', { stage: 'second_strong_read', value: 30 }]]);
+  const missedOther = await request([answer(lunaThirteen), answer(lunaSeventeen), answer(fourRowPaper), answer(droppedRowPaper)]);
+  assert.deepEqual(missedOther.output.consensus.secondStrongRead.closed.map(item => item.field), ['quantity', 'lineTotalExVat']);
+  assert.deepEqual(missedOther.output.consensus.disputedRows, []);
+});
+
 test('v19 (a): the checksum retry shares the slot — its note adds the open places without values, and it votes even when it loses', async () => {
   // שתי תעודות: בראשונה הקריאות נחלקו על שורה 2 ו-Terra נסגר; בשנייה "סהכ חייב מעמ"
   // נקרא 49 בכל הקריאות, ולכן קריאת ההצלה יוצאת — והמשבצת שלה היא גם הקריאה השנייה.
