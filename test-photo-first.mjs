@@ -41,7 +41,16 @@ test('mixed and credit documents are checked but never adopted as ordinary recei
   assert.equal(check.ok, true); assert.equal(check.receivable, false); assert.equal(check.lines, 1);
   assert.equal(tnuvaPaperCheck(doc({ docType: 'credit', subtotalExVat: -50 }), 1).ok, true);
   assert.equal(tnuvaPaperCheck(doc({ docType: 'credit', subtotalExVat: -50 }), 1).receivable, false);
-  assert.equal(tnuvaPaperCheck(doc({ docType: 'unknown' }), 1).receivable, false);
+});
+test('service 17: an unreadable header is a regular document, and the reads never dispute the header', () => {
+  // 15.10: the header was cut off in the photo; every row was read and the paper closed to the agora.
+  const unknown = tnuvaPaperCheck(doc({ docType: 'unknown' }), 1);
+  assert.equal(unknown.ok, true); assert.equal(unknown.receivable, true); assert.deepEqual(unknown.review, []);
+  assert.equal(tnuvaPaperCheck(doc({ docType: undefined }), 1).receivable, true);
+  const fields = diffs => diffs.filter(d => d.scope === 'document').map(d => d.field);
+  assert.deepEqual(fields(scanConsensusDiff(scan(doc({ docType: 'invoice' })), scan(doc({ docType: 'unknown' })))), []);
+  assert.deepEqual(fields(scanConsensusDiff(scan(doc({ docNumber: '561011080' })), scan(doc({ docNumber: null })))), []);
+  assert.deepEqual(fields(scanConsensusDiff(scan(doc()), scan(doc({ docType: 'credit', subtotalExVat: -50 })))), ['docType', 'subtotalExVat']);
 });
 test('crates remain normal products; deposit money counts without becoming product units', () => {
   const d=doc({ subtotalExVat: 63.05, itemsPrintedLines: 3, rows: [row(),
@@ -126,7 +135,7 @@ test('promo sheets without barcodes match only catalog aliases and preserve the 
   const { output, calls } = await requestPromo([promoRow()]);
   assert.equal(output.ok, true);
   assert.equal(output.promoCatalogMatching, true);
-  assert.equal(output.serviceVersion, 16);
+  assert.equal(output.serviceVersion, 17);
   assert.equal(output.sheet.rows[0].barcode, null);
   assert.equal(output.sheet.rows[0].productId, 'catalog-cheese');
   assert.deepEqual(output.sheet.rows[0].candidateProductIds, ['catalog-cheese']);
@@ -602,7 +611,7 @@ test('a key the instance never saw says so, so the client knows to send the phot
   const output = await sendScan(server, { scanKey: 'no-such-key-01', resume: true }).ended;
   assert.equal(output.ok, false);
   assert.equal(output.error, 'resume_unknown');
-  assert.equal(output.serviceVersion, 16);
+  assert.equal(output.serviceVersion, 17);
   assert.equal(calls.length, 0);
   server.close();
 });
