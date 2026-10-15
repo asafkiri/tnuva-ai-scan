@@ -66,7 +66,10 @@ export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // v18: Consensus escalates only on decision fields (a VAT/total sign difference is one; the date is one
 // unless the client sends strongReadSelection:true); the strong read is independent, and when the
 // client sends strongReadSelection:true it must also beat the paper.
-const SERVICE_VERSION = 18;
+// v19: A quantity or price field the strong read selected and no cheap read confirms gets one more
+// strong read in the checksum-retry slot; if it reads the same value and the paper proves itself,
+// the field is accepted. SECOND_STRONG_READ=off restores service 18.
+const SERVICE_VERSION = 19;
 // v13: עבודת סריקה נשמרת חצי שעה אחרי שהסתיימה, ושעה לכל היותר מרגע שנפתחה.
 // זה מכסה בנוחות טלפון שנפל וחוזר, ואינו מחזיק זיכרון מעבר לכך.
 const SCAN_JOB_TTL_MS = 30 * 60 * 1000;
@@ -370,6 +373,18 @@ export function validModelScan(scan, inputDocuments) {
 //   Σ(שורות פריטים) − סד הנחה − Σ(שורות החזרות) ≈ העוגן (סבילות 2 אגורות).
 // מונה השורות שהוקלד ("פריטים") נבדק מול שורות הפריטים בלבד, במדויק.
 // חשבונית זיכוי מודפסת עם מינוס בסיכום ושורות ללא סימן — ההשוואה בערך מוחלט.
+// v19: החשבון של שורה אחת — כמות כפול מחיר היחידה המודפס מול סכום השורה המודפס,
+// באגורות שלמות, עם סבילות העיגול של מחיר יחידה מעוגל (אותה סבילות שבדיקת הנייר
+// השתמשה בה תמיד). true — נסגר; false — אינו נסגר; null — אחד השלושה חסר ואין
+// מה לבדוק. בדיקת הנייר ותנאי C1 של הקריאה החזקה השנייה משתמשים באותה פונקציה.
+export function tnuvaRowArithmetic(row) {
+  const qty = row && row.quantity, unit = row && row.unitPriceExVat, total = row && row.lineTotalExVat;
+  const amount = total == null || total === '' || !Number.isFinite(Number(total)) ? null : Math.round(Number(total) * 100);
+  if (!(qty != null && Number.isFinite(qty) && unit != null && Number.isFinite(unit) && amount != null)) return null;
+  const roundedUnit = Math.abs(unit * 100 - Math.round(unit * 100)) < 0.000001;
+  const tolerance = roundedUnit ? Math.max(1, Math.ceil(Math.abs(qty) * 0.5 + 0.5)) : 1;
+  return Math.abs(Math.round(unit * qty * 100) - amount) <= tolerance;
+}
 export function tnuvaPaperCheck(input, pageCount) {
   // Use the untouched supplier output, before the client maps product codes.
   const doc = input && (input.__tnuvaPaper || input);
@@ -394,12 +409,7 @@ export function tnuvaPaperCheck(input, pageCount) {
     // Tnuva prints gross amounts in each item row, with discounts only below
     // the table. Check quantity against the printed unit price, allowing its
     // documented rounding; never replace any of the three printed values.
-    const unit = row && row.unitPriceExVat;
-    if (qty != null && Number.isFinite(qty) && unit != null && Number.isFinite(unit) && amount != null) {
-      const roundedUnit = Math.abs(unit * 100 - Math.round(unit * 100)) < 0.000001;
-      const tolerance = roundedUnit ? Math.max(1, Math.ceil(Math.abs(qty) * 0.5 + 0.5)) : 1;
-      if (Math.abs(Math.round(unit * qty * 100) - amount) > tolerance) problems.push('שורה ' + (index + 1) + ': כמות כפול מחיר אינה תואמת לסכום המודפס');
-    }
+    if (tnuvaRowArithmetic(row) === false) problems.push('שורה ' + (index + 1) + ': כמות כפול מחיר אינה תואמת לסכום המודפס');
     if (row && row.section === 'returns') { returnLines++; returnsCents += amount || 0; }
     else { itemLines++; itemsCents += amount || 0; if (qty != null && !/פ.?קדון/.test(String(row && row.description || ''))) units += Number(qty) || 0; }
   });
@@ -854,6 +864,11 @@ export function scanConsensusDocDateUnconfirmed(selected, others) {
 // הערכים ("נקרא פעם X ופעם Y") — ומודל שמקבל שתי תשובות בוחר ביניהן במקום
 // לקרוא את הנייר, ועד שבוחר בין שתי טעויות אינו עד שלישי. עכשיו היא מקבלת רק
 // את המקום: מסמך, עמוד, מספר שורה ושם השדה, בלי אף ערך שנקרא.
+// v19: הכשל הידוע של הנייר הזה, כפי שהוא נמסר לכל קריאה חזקה שמקבלת מקומות.
+const CONSENSUS_KNOWN_FAILURE_TEXT =
+  ` כשל ידוע בנייר הזה: עמודת הקוד נקראת בהסטה של שורה אחת, כך שקוד של שורה אחת נדבק לכמות ולמחיר של השורה שאחריה.` +
+  ` לכן ודא לכל שורה שהקוד, התיאור, הכמות, המחיר והסכום נקראו כולם מאותה שורה אופקית בטבלה, ושמספר השורות שקראת שווה למונה "פריטים" המודפס.` +
+  ` קוד שאינו קריא בביטחון — החזר null לאותה שורה בלבד, ואל תזיז בגללו את שאר העמודה.`;
 function consensusCorrectiveText(diffs, reads = []) {
   const label = field => field === "rowCount" ? "מספר השורות"
     : field === "row" ? "קיום השורה (ייתכן שפוצלה, הוכפלה, הומצאה או הושמטה)"
@@ -880,9 +895,121 @@ function consensusCorrectiveText(diffs, reads = []) {
     ? `שתי קריאות קודמות של אותו צילום נחלקו במקומות האלה: ${parts.join(" ")}` +
       ` הערכים שנקראו אינם נמסרים לך בכוונה: קרא את הצילום באופן עצמאי, מההתחלה ועד הסוף, כאילו לא נקרא מעולם — שתי הקריאות הקודמות עשויות לטעות. המקומות שלמעלה הם רק המקומות שבהם כדאי להאט ולבדוק פעמיים.`
     : `קריאה מקבילה של אותו צילום לא הושלמה, ואין קריאה שנייה להשוות אליה. קרא את הצילום באופן עצמאי, מההתחלה ועד הסוף.`) +
-    ` כשל ידוע בנייר הזה: עמודת הקוד נקראת בהסטה של שורה אחת, כך שקוד של שורה אחת נדבק לכמות ולמחיר של השורה שאחריה.` +
-    ` לכן ודא לכל שורה שהקוד, התיאור, הכמות, המחיר והסכום נקראו כולם מאותה שורה אופקית בטבלה, ושמספר השורות שקראת שווה למונה "פריטים" המודפס.` +
-    ` קוד שאינו קריא בביטחון — החזר null לאותה שורה בלבד, ואל תזיז בגללו את שאר העמודה.`;
+    CONSENSUS_KNOWN_FAILURE_TEXT;
+}
+
+// ===== v19: הקריאה החזקה השנייה =====
+// הכרעת הבעלים: שתי הקריאות הזולות מסכימות — מתקבל. נחלקו — Terra קורא, ושדה
+// ש-Terra מסכים בו עם אחת מהן מתקבל (2 מתוך 3, ללא שינוי). שדה ש-Terra אינו
+// מסכים בו עם אף אחת מהן — קריאה חזקה שנייה, ואם היא קוראת אותו כמו Terra הוא
+// מתקבל בלי פעולה של העובד. אחרת העובד מאשר או מתקן, כמו היום. "מתקבל" הוא לפי
+// שדה ושורה, לעולם לא לפי תעודה שלמה.
+// הקריאה השנייה רק מצביעה: הערך תמיד של הקריאה שנבחרה, היא לעולם אינה נבחרת,
+// ואינה מוסיפה שום מחלוקת. היא נספרת רק כשהקריאה שנבחרה היא Terra עצמו — כשקריאה
+// זולה נבחרה לפי הנייר, Terra כבר חלק עליה, ושתי קריאות חזקות שאינן מסכימות זו עם
+// זו אינן מאשרות דבר. חמשת התנאים:
+// C1 — הנייר מוכיח את עצמו: התעודה שנבחרה נסגרת מול "סהכ חייב מעמ" ומונה "פריטים"
+//      המודפסים (tnuvaPaperCheck), ובשורה עצמה כמות × מחיר = סכום (tnuvaRowArithmetic).
+// C2 — רק כמות, מחיר יחידה וסכום שורה של שורת פריטים רגילה: לא קוד, לא כוכבית, לא
+//      מקטע, לא קיום שורה, לא שדות סיכום; לא החזרות, לא פיקדון, לא זיכוי ולא נייר
+//      מעורב (כל תעודה שאינה receivable).
+// C3 — ההנחיה נותנת רק מקומות ואת הכשל הידוע, אף פעם לא ערך שנקרא; המודל החזק, מאמץ גבוה.
+// C4 — כל שדה שנסגר כך נרשם ב-consensus.secondStrongRead וביומן invoice_scan_audit,
+//      עם הערך שכל קריאה ראתה.
+// C5 — SECOND_STRONG_READ=off מחזיר את שירות 18 כפי שהיה.
+const SECOND_STRONG_FIELDS = new Set(["quantity", "unitPriceExVat", "lineTotalExVat"]);
+const SECOND_STRONG_RULE = "second_strong_read";
+// C1 + C2 לשדה אחד, מול הקריאה שנבחרה בלבד.
+function secondStrongEligible(doc, row, field, pageCount) {
+  if (!SECOND_STRONG_FIELDS.has(field) || !doc || !row) return false;
+  if (row.section !== "items" || /פ.?קדון/.test(String(row.description || ""))) return false;
+  // receivable = הנייר נסגר וגם אין בו זיכוי, החזרות, מינוס בסיכום או סכום שאינו חיובי.
+  return tnuvaPaperCheck(doc, pageCount).receivable === true && tnuvaRowArithmetic(row) === true;
+}
+// השדות שאף עד אינו מאשר והקריאה החזקה השנייה רשאית לסגור. העדים הם אותם עדים של
+// disputedRows (הקריאות הזולות שהושלמו, וקריאת ההכרעה כשאינה זו שנבחרה).
+export function scanSecondStrongOpenFields(selected, witnesses, inputDocuments) {
+  const docs = (selected && selected.documents) || [];
+  const out = [];
+  for (const entry of scanConsensusDisputedRows(selected, witnesses)) {
+    const doc = docs.find(item => Number(item && item.noteIndex) === entry.noteIndex);
+    const input = (inputDocuments || []).find(item => Number(item && item.noteIndex) === entry.noteIndex);
+    const row = doc && Array.isArray(doc.rows) ? doc.rows[entry.rowIndex] : null;
+    if (!input || !Array.isArray(input.pages)) continue;
+    for (const item of entry.fields) {
+      if (item.confirmed !== 0 || !secondStrongEligible(doc, row, item.field, input.pages.length)) continue;
+      out.push({ noteIndex: entry.noteIndex, rowIndex: entry.rowIndex, page: Number.isInteger(row.sourcePage) ? row.sourcePage : null,
+        lineNumber: entry.lineNumber, field: item.field });
+    }
+  }
+  return out;
+}
+// מה קריאה אחרת ראתה בשדה של שורה שנבחרה — לפי אותו יישור ואותה השוואה של diffs.
+function consensusFieldReader(selected, other) {
+  const key = (noteIndex, rowIndex, field) => noteIndex + ":" + rowIndex + ":" + field;
+  const diffs = new Map();
+  for (const diff of consensusDiffAll(selected, other)) {
+    if (diff.scope === "row" && diff.rowIndex !== null && diff.rowIndex !== undefined) diffs.set(key(diff.noteIndex, diff.rowIndex, diff.field), diff);
+  }
+  const notes = new Set(((other && other.documents) || []).map(doc => Number(doc && doc.noteIndex)));
+  return (noteIndex, rowIndex, field, selectedValue) => {
+    if (!notes.has(Number(noteIndex)) || diffs.has(key(noteIndex, rowIndex, "row"))) return { seen: false, agrees: false, value: null };
+    const diff = diffs.get(key(noteIndex, rowIndex, field));
+    return diff ? { seen: true, agrees: false, value: diff.values[1] ?? null } : { seen: true, agrees: true, value: selectedValue };
+  };
+}
+// הספירה: לכל שדה פתוח — הערך שכל קריאה ראתה, ואם הקריאה החזקה השנייה קראה בדיוק
+// את הערך שנבחר, השדה נסגר בכלל second_strong_read. extra=null — הקריאה נכשלה, ושום
+// דבר אינו נסגר. selected, witnesses ו-extra הם {stage, scan}.
+export function scanSecondStrongReadVotes(selected, witnesses, extra, places) {
+  const docs = (selected && selected.scan && selected.scan.documents) || [];
+  const readers = (witnesses || []).filter(Boolean).map(item => ({ stage: item.stage, read: consensusFieldReader(selected.scan, item.scan) }));
+  const extraRead = extra && extra.scan ? consensusFieldReader(selected.scan, extra.scan) : null;
+  const closed = [], open = [];
+  for (const place of places || []) {
+    const doc = docs.find(item => Number(item && item.noteIndex) === place.noteIndex);
+    const row = doc && Array.isArray(doc.rows) ? doc.rows[place.rowIndex] : null;
+    const value = row ? row[place.field] ?? null : null;
+    const seen = (stage, vote) => ({ stage, value: vote.value, ...(vote.seen ? {} : { seen: false }) });
+    const reads = [{ stage: selected.stage, value, selected: true }]
+      .concat(readers.map(item => seen(item.stage, item.read(place.noteIndex, place.rowIndex, place.field, value))));
+    const vote = extraRead ? extraRead(place.noteIndex, place.rowIndex, place.field, value) : null;
+    if (vote) reads.push(seen(extra.stage, vote));
+    const entry = { ...place, value, reads };
+    if (vote && vote.agrees && row) closed.push({ ...entry, rule: SECOND_STRONG_RULE });
+    else open.push({ ...entry, reason: !vote ? "failed" : vote.seen ? "disagrees" : "not_seen" });
+  }
+  return { closed, open };
+}
+// שדה שנסגר יוצא מ-disputedRows; שורה שלא נשאר בה שדה יוצאת כולה.
+function withoutSecondStrongClosures(disputedRows, closed) {
+  const gone = new Set((closed || []).map(item => item.noteIndex + ":" + item.rowIndex + ":" + item.field));
+  if (!gone.size) return disputedRows;
+  return disputedRows.map(entry => ({ ...entry, fields: entry.fields.filter(item => !gone.has(entry.noteIndex + ":" + entry.rowIndex + ":" + item.field)) }))
+    .filter(entry => entry.fields.length);
+}
+// C3: רק המקום — מסמך, עמוד, מספר שורה ושם השדה. אף ערך שנקרא, של אף קריאה.
+function secondStrongPlacesText(places) {
+  const byPlace = new Map();
+  for (const item of places || []) {
+    const where = `מסמך noteIndex=${item.noteIndex}${item.page ? `, עמוד ${item.page}` : ""}, שורה ${item.lineNumber}`;
+    if (!byPlace.has(where)) byPlace.set(where, []);
+    if (!byPlace.get(where).includes(item.field)) byPlace.get(where).push(item.field);
+  }
+  const parts = [...byPlace].slice(0, MAX_CONSENSUS_CORRECTIVE_LINES).map(([where, fields]) => `${where}: ${fields.join(", ")}.`);
+  if (byPlace.size > parts.length) parts.push(`ועוד ${byPlace.size - parts.length} מקומות.`);
+  return parts.join(" ");
+}
+function secondStrongCorrectiveText(places) {
+  return `קריאות קודמות של אותו צילום לא אישרו זו את זו בשדות האלה: ${secondStrongPlacesText(places)}` +
+    ` הערכים שנקראו אינם נמסרים לך בכוונה: קרא את הצילום באופן עצמאי, מההתחלה ועד הסוף, כאילו לא נקרא מעולם — הקריאות הקודמות עשויות לטעות. המקומות שלמעלה הם רק המקומות שבהם כדאי להאט ולבדוק פעמיים.` +
+    ` כמות, מחיר יחידה וסכום שורה נקראים כל אחד מהעמודה שלו בדיוק כפי שהוא מודפס — אל תחשב אחד מהאחרים כדי שיסתדרו.` +
+    CONSENSUS_KNOWN_FAILURE_TEXT;
+}
+// (a) קריאת ההצלה של סכום הביקורת חולקת את המשבצת: ההנחיה שלה נשארת כפי שהייתה,
+// ובסופה רק המקומות של השדות הפתוחים — בלי ערכים.
+function secondStrongChecksumAddendum(places) {
+  return ` בנוסף, קריאות קודמות של אותו צילום לא אישרו זו את זו בשדות האלה (הערכים אינם נמסרים לך בכוונה — קרא אותם מהצילום בעצמך): ${secondStrongPlacesText(places)}`;
 }
 
 
@@ -1174,6 +1301,14 @@ function getConsensusReads(env) {
   const configured = Number.parseInt(typeof env.OPENAI_CONSENSUS_READS === "string" ? env.OPENAI_CONSENSUS_READS.trim() : "", 10);
   if (Number.isInteger(configured) && configured >= 1 && configured <= 3) return configured;
   return 2;
+}
+
+// v19: מתג ההפסקה של הקריאה החזקה השנייה. דולק כברירת מחדל; SECOND_STRONG_READ=off
+// (וגם false או 0) ב-Cloud Run מחזיר את שירות 18 בדיוק — אותן בקשות, אותן תוצאות.
+// בלי מודל הסלמה אין קריאה חזקה כלל, ולכן גם לא שנייה.
+function getSecondStrongRead(env, retryModel) {
+  const configured = typeof env.SECOND_STRONG_READ === "string" ? env.SECOND_STRONG_READ.trim().toLowerCase() : "";
+  return !["off", "false", "0"].includes(configured) && Boolean(retryModel);
 }
 
 // ===== v130: המנתח — בניית הקלט, אימות הפלט =====
@@ -1576,6 +1711,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
       const openaiRetryModel = getOpenAIRetryModel(env);
       const openaiRetryTier = getOpenAIRetryServiceTier(env, openaiServiceTier);
       const consensusReads = getConsensusReads(env);
+      const secondStrongReadOn = getSecondStrongRead(env, openaiRetryModel);
 
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
         writeJson(response, origin, 200, {
@@ -1590,6 +1726,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
           resumableScans: true, // v13: סריקה ששרדה נתק ניתנת לאיסוף עם אותו מפתח
           promoCatalogMatching: true,
           strongReadSelection: true, // v18: מכבד strongReadSelection:true בגוף הסריקה
+          secondStrongRead: secondStrongReadOn, // v19: false כש-SECOND_STRONG_READ=off או כשאין מודל הסלמה
           retryModel: openaiRetryModel || null,
           retryServiceTier: openaiRetryModel ? openaiRetryTier : null,
           keyConfigured: keyStatus === "ready",
@@ -1956,6 +2093,11 @@ function decodeAnalyzeClaims(result, aliasToId) {
       scanJob = createScanJob(scanKey ? scanJobId(uid, scanKey) : null);
       scanHeartbeat = streamScanJob(scanJob, request, response, origin);
       const scanAudit = { version: 1, id: crypto.randomUUID(), startedAt: now(), attempts: [] };
+      // v19 (C4): אותה רשומה ב-consensus.secondStrongRead וביומן invoice_scan_audit. כשהמתג
+      // כבוי היא אינה קיימת כלל, והתשובה והיומן הם של שירות 18.
+      const secondStrongRead = secondStrongReadOn
+        ? { outcome: "not_needed", stage: null, model: null, requestId: null, asked: 0, usage: null, closed: [], open: [] } : null;
+      if (secondStrongRead) scanAudit.secondStrongRead = secondStrongRead;
       const finishScan = (value) => {
         scanAudit.completedAt = now();
         scanAudit.result = !value.ok ? (value.error || 'failed') : value.paperValidation
@@ -2110,6 +2252,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
         model: openaiModel, agreed: null, escalated: false, escalationModel: null, escalationError: null,
         escalationSelected: false, unverifiedSingleRead: false, strongReadSelection,
         reason: null, diffs: [], disputedRows: [], missingRows: [], docDateUnconfirmed: [] };
+      if (secondStrongRead) consensus.secondStrongRead = secondStrongRead;
       let attempt = goodReads[0];
       let escalationRead = null; // v14: גם קריאת ההסלמה היא עדה, אם קריאת ההצלה החליפה אותה אחר כך
       if (consensusReads > 1) {
@@ -2212,9 +2355,34 @@ function decodeAnalyzeClaims(result, aliasToId) {
         });
         return;
       }
+      // v19: העדים של הקריאה שנבחרה — אותה רשימה ש-disputedRows נמדד מולה למטה.
+      const witnessReadsOf = selected => goodReads.concat(escalationRead ? [escalationRead] : []).filter(read => read.scan !== selected);
+      // v19: השדות שהקריאה החזקה השנייה רשאית לסגור, מול הקריאה שנבחרה עכשיו. רק כש-Terra
+      // הוא הקריאה שנבחרה: אז "אף עד אינו מאשר" פירושו ש-Terra לא הסכים עם אף קריאה זולה.
+      const strongSelected = escalationRead !== null && escalationRead.scan === scan;
+      const openFields = secondStrongRead && strongSelected
+        ? scanSecondStrongOpenFields(scan, witnessReadsOf(scan).map(read => read.scan), documents) : [];
+      let secondStrongWitness = null; // {stage, scan} — מצביעה בלבד, לעולם אינה נבחרת
+      let secondStrongAsked = [];
+      const recordSecondStrong = (stage, asked, result, attemptAudit) => {
+        secondStrongAsked = asked;
+        Object.assign(secondStrongRead, { stage, model: attemptAudit ? attemptAudit.requestedModel : openaiRetryModel, asked: asked.length,
+          requestId: attemptAudit ? attemptAudit.requestId || null : null, usage: attemptAudit ? attemptAudit.usage || null : null });
+        if (result.fail) {
+          secondStrongRead.outcome = "failed";
+          secondStrongRead.error = result.fail.body && result.fail.body.error || "second_strong_read_failed";
+        }
+      };
       if (firstMismatches.some(item => item.retryable !== false)) {
         checksumRetryAttempted = true;
-        const second = await attemptScan(checksumCorrectiveText(firstMismatches), CHECKSUM_RETRY_REASONING_EFFORT, true); // v7: הסלמה
+        // v19 (a): המשבצת משותפת. קריאת ההצלה יוצאת כמו תמיד, ובהנחיה שלה גם המקומות של
+        // השדות הפתוחים — בלי ערכים. מסמך שההנחיה נושאת את הסכומים שלו אינו נשאל.
+        const noteDocs = new Set(firstMismatches.map(item => Number(item.noteIndex)));
+        const asked = openFields.filter(item => !noteDocs.has(Number(item.noteIndex)));
+        const attemptsBefore = scanAudit.attempts.length;
+        const second = await attemptScan(checksumCorrectiveText(firstMismatches) + (asked.length ? secondStrongChecksumAddendum(asked) : ""),
+          CHECKSUM_RETRY_REASONING_EFFORT, true); // v7: הסלמה
+        let retryWon = false;
         if (!second.fail) {
           const secondMismatches = scanChecksumMismatches(second.scan, documents);
           second.audit.validation = photoFirst ? paperChecks(second.scan) : secondMismatches;
@@ -2223,6 +2391,15 @@ function decodeAnalyzeClaims(result, aliasToId) {
           if (!lostSummary && (!secondMismatches.length || checksumTotalError(secondMismatches) < checksumTotalError(firstMismatches))) {
             attempt.audit.selected = false; second.audit.selected = true;
             ({ scan, data, openaiResponse } = second);
+            retryWon = true;
+          }
+        }
+        if (asked.length) {
+          recordSecondStrong("checksum_retry", asked, second, scanAudit.attempts[attemptsBefore]);
+          // קריאת הצלה שניצחה היא הקריאה שנבחרה, ולכן אינה מצביעה על עצמה; שהפסידה — עדה.
+          if (!second.fail) {
+            secondStrongRead.outcome = retryWon ? "selected" : "read";
+            if (!retryWon) secondStrongWitness = { stage: "checksum_retry", scan: second.scan };
           }
         }
         for (const item of scanChecksumMismatches(scan, documents)) {
@@ -2232,6 +2409,17 @@ function decodeAnalyzeClaims(result, aliasToId) {
               (item.expectedLines != null && item.gotLines !== item.expectedLines ? ` (${item.gotLines} שורות במקום ${item.expectedLines})` : "") +
               ` גם אחרי קריאה חוזרת — נדרשת בדיקה.`;
           if (!scan.warnings.includes(warning)) scan.warnings.push(warning);
+        }
+      } else if (openFields.length) {
+        // v19 (b): הנייר של הקריאה שנבחרה אינו צריך הצלה, ולכן המשבצת פנויה לקריאה חזקה
+        // שנייה אחת — אותם צילומים, המודל החזק, מאמץ גבוה, ובהנחיה רק המקומות. כך המקסימום
+        // נשאר ארבע קריאות וההמתנה הגרועה אינה גדלה. כישלון אינו חוזר ואינו משנה דבר.
+        const attemptsBefore = scanAudit.attempts.length;
+        const extra = await attemptScan(secondStrongCorrectiveText(openFields), CHECKSUM_RETRY_REASONING_EFFORT, true, SECOND_STRONG_RULE);
+        recordSecondStrong(SECOND_STRONG_RULE, openFields, extra, scanAudit.attempts[attemptsBefore]);
+        if (!extra.fail) {
+          secondStrongRead.outcome = "read";
+          secondStrongWitness = { stage: SECOND_STRONG_RULE, scan: extra.scan };
         }
       }
 
@@ -2246,6 +2434,17 @@ function decodeAnalyzeClaims(result, aliasToId) {
         const paperOk = new Map(paperChecks(scan).map(check => [Number(check.noteIndex), check.ok === true]));
         const options = { paperConfirmsRows: noteIndex => paperOk.get(Number(noteIndex)) === true };
         consensus.disputedRows = scanConsensusDisputedRows(scan, witnesses, options);
+        // v19: הקריאה החזקה השנייה מצביעה רק על השדות שנשאלה עליהם, מול אותה קריאה נבחרת
+        // (Terra) שהשדות חושבו מולה. היא אינה עדה ל-missingRows, לתאריך או לקוד: שם היא רק
+        // הייתה מוסיפה או מסירה מחלוקות שאינן שלה (C2). קריאת הצלה שניצחה אינה מצביעה.
+        if (secondStrongRead && secondStrongAsked.length && secondStrongRead.outcome !== "selected") {
+          const selectedRead = { stage: attempt.audit.stage, scan };
+          const votes = scanSecondStrongReadVotes(selectedRead,
+            witnessReadsOf(scan).map(read => ({ stage: read.audit.stage, scan: read.scan })), secondStrongWitness, secondStrongAsked);
+          secondStrongRead.closed = votes.closed;
+          secondStrongRead.open = votes.open;
+          consensus.disputedRows = withoutSecondStrongClosures(consensus.disputedRows, votes.closed);
+        }
         consensus.missingRows = scanConsensusMissingRows(scan, witnesses, options);
         for (const item of consensus.disputedRows) {
           // קוד שקריאה נוספת מאשרת אינו דורש אישור ידני — המאגר מכריע אצל הלקוח.

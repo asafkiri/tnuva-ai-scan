@@ -1,4 +1,88 @@
-# Tnuva invoice scanner — service 18
+# Tnuva invoice scanner — service 19
+
+## Service 19
+
+Service 19 adds a second strong read. It runs for a field that the strong read
+decided and no cheap read confirms. This is the owner's approved design, live
+with no trial period:
+
+1. The two cheap reads agree: the read is accepted, as before.
+2. They disagree: the strong read (`OPENAI_RETRY_MODEL`, Terra) reads the
+   photo. A field where Terra agrees with one cheap read is accepted. This is
+   the existing 2-of-3 rule, unchanged.
+3. On a field where Terra agrees with neither cheap read, a second strong read
+   (Terra#2) reads the photo. If Terra#2 reads that field exactly as Terra did,
+   the field is accepted and the worker does nothing.
+4. Otherwise the field goes to the worker as today, in
+   `consensus.disputedRows`, with the selected read's value.
+
+"Accepted" applies to one field of one row, never to a whole document.
+Terra#2 only votes for a value. The selected read supplies every value, and
+Terra#2 is never the selected read. Terra#2 never adds a dispute: what it reads
+elsewhere is not compared, and it is not a witness for `missingRows`, for
+`docDateUnconfirmed` or for a code.
+
+Terra#2 seconds Terra only. When a client sends `strongReadSelection: true`
+and a cheap read is selected because its paper closes better, Terra has
+already disagreed with that read on every open field. Two strong reads that
+disagree confirm nothing, so no extra read is bought. Apart from that, the rule
+does not depend on the flag: it only removes disputes.
+
+**The slot.** Terra#2 shares the checksum-retry slot, so a scan still makes at
+most four model calls and the worst-case wait does not grow:
+
+- (a) If the selected paper fails and can be retried, the checksum retry runs
+  as before. Its note is service 18's note, followed by the locations of the
+  open fields that Terra#2 could settle. A retry that wins becomes the
+  selected read, as before (`outcome: "selected"`), and it votes for nothing.
+  A retry that loses is the extra read, and its votes count. A document whose
+  sums the checksum note quotes is never asked about.
+- (b) Otherwise, if an eligible field is open after the escalation, one call
+  runs with stage `second_strong_read`.
+
+A Terra#2 call that fails or times out changes nothing and is never retried.
+
+**The five conditions.** A field closes through Terra#2 only when all five
+hold:
+
+- **C1, paper proof.** The selected document must pass `tnuvaPaperCheck`
+  against its own printed `סהכ חייב מעמ` and `פריטים` counter. The row's own
+  arithmetic must also close: quantity × unit price must equal the line total,
+  within the rounded-unit allowance the paper check has always used. That
+  allowance now lives in `tnuvaRowArithmetic`, and the paper check calls it.
+  A row whose quantity, unit price or line total was not read cannot close.
+- **C2, scope.** Only `quantity`, `unitPriceExVat` and `lineTotalExVat` of an
+  ordinary item row can close. The following never close: the code, the
+  promotion star, the section, the page, a row's existence, the row count, a
+  summary field, the returns section, a deposit row (`פיקדון`), a credit note,
+  a credit marked only by a minus, and a mixed paper. In practice the selected
+  document must be `receivable`. A code dispute stays exactly as in service
+  18, `confirmed` count included. That count drives the "manual approval"
+  warning and the app's catalog route, so raising it would settle an identity.
+- **C3, independence.** The note carries only locations (document, page,
+  printed line, field name) and the known-failure warnings. It carries no
+  value from any earlier read. The read uses the same photos and system prompt
+  as the cheap reads, on `OPENAI_RETRY_MODEL` at high effort.
+- **C4, logging.** `consensus.secondStrongRead` holds
+  `{outcome, stage, model, requestId, asked, usage, closed, open}`, plus
+  `error` when the call failed. The same object goes to
+  `scanAudit.secondStrongRead` and to the `invoice_scan_audit` log line. Each
+  entry in `closed` names `noteIndex`, `rowIndex`, `page`, `lineNumber`,
+  `field` and the selected `value`, and it carries `rule:
+  "second_strong_read"`. It also lists what every read saw under `reads`
+  (`{stage, value}`, with `seen: false` for a read that did not see the row).
+  `open` lists the fields that were asked about and left for the worker, with
+  `reason` set to `disagrees`, `not_seen` or `failed`. The extra call is an
+  ordinary attempt in `scanAudit.attempts`, with its usage.
+- **C5, kill switch.** `SECOND_STRONG_READ=off` (also `false` or `0`) restores
+  service 18. With it, the service sends byte-identical model requests and
+  returns the same answer, and `secondStrongRead` is absent from the response
+  and from the log. The default is on. `/health` reports `secondStrongRead`,
+  which is true only when the switch is on and a retry model is configured,
+  since without a retry model there is no strong read.
+
+Possible values of `outcome`: `not_needed` (no extra read was asked anything),
+`read`, `selected` (case (a) only) and `failed`.
 
 ## Service 18
 
@@ -256,6 +340,16 @@ unchanged.
 `npm test` runs deterministic arithmetic and the actual HTTP handler with
 fixture Firebase signatures and mocked model responses. No paid requests.
 
+Service 19 can be deployed before or after any app. It adds the
+`consensus.secondStrongRead` record and the `second_strong_read` stage in
+`scanAudit.attempts`, and it only removes entries from
+`consensus.disputedRows`. Apps up to 142 ignore the new record. App 142's
+token counter lists only the `consensus*` stages, so the extra call shows up
+only in `scanAudit` until the app lists it. `/health` must report
+`serviceVersion:19` and `secondStrongRead:true`, as well as everything listed
+for service 18 below. To roll back without a deploy, set
+`SECOND_STRONG_READ=off`.
+
 The order of release no longer matters. Service 18 selects by the paper, and
 lets a date difference go without a paid read, only for a scan whose request
 carried `"strongReadSelection": true`, and only app 142 sends it. App 141 and
@@ -283,7 +377,7 @@ date when the first cheap read was selected. It takes the selected read from
 `scanAudit.attempts` and, without it, from the service-16 meaning of
 `escalated`. Otherwise the date is treated as disputed. Deploy this source to
 the existing `tnuva-ai-scan` service whenever it is ready, before or after app
-142. `/health` must report `serviceVersion:18`, `strongReadSelection:true`,
+142. `/health` must report `serviceVersion:19` (18 for service 18 itself), `strongReadSelection:true`,
 `resumableScans:true`, `photoFirst:true`, `scanAuditVersion:1`,
 `keyStatus:"ready"`, and `retryModel:"gpt-5.6-terra"` — without a retry model
 the escalation runs on the base model and buys nothing.
@@ -293,5 +387,6 @@ Preserve the verified runtime configuration:
 - `OPENAI_RETRY_MODEL=gpt-5.6-terra`
 - `OPENAI_RETRY_SERVICE_TIER=priority`
 - Base service tier `default`, `fastMode:false`.
+- `SECOND_STRONG_READ` unset (on). Set it to `off` only to roll back to service 18.
 
 Then test real receiving in the store.
