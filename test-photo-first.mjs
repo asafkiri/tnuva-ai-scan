@@ -52,6 +52,17 @@ test('service 17: an unreadable header is a regular document, and the reads neve
   assert.deepEqual(fields(scanConsensusDiff(scan(doc({ docNumber: '561011080' })), scan(doc({ docNumber: null })))), []);
   assert.deepEqual(fields(scanConsensusDiff(scan(doc()), scan(doc({ docType: 'credit', subtotalExVat: -50 })))), ['docType', 'subtotalExVat']);
 });
+test('service 17: a credit note whose title was cut is stopped by its minus signs, without a paid retry', () => {
+  // The paper sums close in absolute value, so there is nothing for a corrective read to "fix" by dropping the minus.
+  const cut = tnuvaPaperCheck(doc({ docType: 'invoice', subtotalExVat: -50, vatAmount: -9, totalInclVat: -59 }), 1);
+  assert.equal(cut.ok, true); assert.equal(cut.receivable, false); assert.equal(cut.retryable, false);
+  assert.match(cut.review.join(' '), /כנראה חשבונית זיכוי/);
+  assert.deepEqual(scanChecksumMismatches(scan(doc({ subtotalExVat: -50, vatAmount: -9, totalInclVat: -59 })), input), []);
+  // Only part of the minus survived the read: still not ordinary goods.
+  const partial = tnuvaPaperCheck(doc({ itemsSectionTotalExVat: -50, vatAmount: -9, totalInclVat: -59 }), 1);
+  assert.equal(partial.ok, true); assert.equal(partial.receivable, false);
+  assert.equal(tnuvaPaperCheck(doc({ roundingDiff: -0.03 }), 1).receivable, true, 'a negative rounding line is normal');
+});
 test('crates remain normal products; deposit money counts without becoming product units', () => {
   const d=doc({ subtotalExVat: 63.05, itemsPrintedLines: 3, rows: [row(),
     row({ description: 'ארגז', quantity: 1, unitPriceExVat: 10, lineTotalExVat: 10 }),

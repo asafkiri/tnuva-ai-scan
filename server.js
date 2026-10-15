@@ -317,7 +317,7 @@ const SYSTEM_PROMPT = `אתה מפענח תעודות משלוח וחשבוני�
 10. שדות הסיכום מוחזרים בדיוק כפי שהם מודפסים: itemsSectionTotalExVat הוא סה"כ מקטע הפריטים אם מודפס בנפרד; promoDiscountExVat הוא סכום שורת "סד הנחה בגין מבצעים"; returnsSectionTotalExVat הוא סה"כ מקטע ההחזרות; subtotalExVat הוא "סהכ חייב מעמ" — הסכום הסופי לפני מע"מ; vatAmount הוא סכום המע"מ; totalInclVat הוא הסכום כולל מע"מ; roundingDiff הוא "הפרש עיגול" עם הסימן המודפס. שדה שאינו מודפס או אינו קריא — null.
 11. vatPct הוא אחוז המע"מ כפי שמודפס על המסמך (למשל 18). לעולם אל תניח אחוז ואל תשתמש בידע כללי — אם אינו מודפס או אינו קריא, החזר null והוסף אזהרה.
 12. itemsPrintedLines ו-returnsPrintedLines הם מוני "פריטים" המודפסים בסיכום של כל מקטע. אל תחשב אותם בעצמך אם אינם מודפסים. על הנייר של תנובה אין מונה יחידות כולל — אין שדה כזה בפלט.
-13. docType הוא "credit" רק אם רואים במפורש שהמסמך הוא חשבונית זיכוי (חש. זיכוי או ניסוח דומה), ו-"invoice" בכל מקרה אחר — גם כשהכותרת חתוכה או אינה קריאה. מספר התעודה אינו נדרש: אל תחפש אותו ואל תוסיף אזהרה על כותרת או מספר תעודה שחתוכים או אינם קריאים. בחשבונית זיכוי החזר את סכומי הסיכום עם המינוס כפי שמודפס, ואת השורות ללא סימן כפי שמודפסות.
+13. docType הוא "credit" רק אם רואים במפורש שהמסמך הוא חשבונית זיכוי (חש. זיכוי או ניסוח דומה), ו-"invoice" בכל מקרה אחר — גם כשהכותרת חתוכה או אינה קריאה. מספר התעודה אינו נדרש: אל תחפש אותו ואל תוסיף אזהרה על כותרת או מספר תעודה שחתוכים או אינם קריאים. החזר כל סכום בסיכום עם הסימן המודפס, כולל מינוס לפני המספר או אחריו, גם כשהכותרת אינה נראית; את השורות החזר ללא סימן כפי שמודפסות.
 14. docDate הוא תאריך המסמך המודפס, בדיוק כפי שמופיע. description מכיל רק את תיאור המוצר כפי שהוא מודפס, גם אם הוא מקוצר — אל תרחיב אותו לשם מלא ואל תתקן אותו לפי מוצר מוכר.
 15. אם חלק מהעמוד מטושטש, חלץ את השורות הקריאות והוסף אזהרה מפורשת לגבי החלק שלא נקרא. אל תמציא שורות ואל תדווח על אפס שורות כאשר נראית טבלת מוצרים שאינך מצליח לקרוא בביטחון.
 16. pageCount הוא מספר התמונות שסומנו עבור אותו noteIndex, לא מספר העמוד שמודפס על הנייר. sourcePage מתחיל ב-1 ומתייחס למיקום התמונה בתוך המסמך.
@@ -407,7 +407,10 @@ export function tnuvaPaperCheck(input, pageCount) {
   const promo = Math.abs(cents(doc && doc.promoDiscountExVat) || 0);
   const net = itemsCents - promo - returnsCents;
   const credit = doc && doc.docType === 'credit';
-  const expected = credit && subtotal != null ? Math.abs(subtotal) : subtotal;
+  // v141: מינוס על סכום מסכם הוא סימן לזיכוי גם כשהכותרת ("זיכוי") לא צולמה.
+  // החשבון נבדק אז בערך מוחלט, כדי שקריאה חוזרת לא "תתקן" אותו בהשמטת המינוס.
+  const minusSummary = !credit && [subtotal, itemSummary, cents(doc && doc.vatAmount), cents(doc && doc.totalInclVat)].some(v => v != null && v < 0);
+  const expected = (credit || minusSummary) && subtotal != null ? Math.abs(subtotal) : subtotal;
   // The numbers themselves, not only the fact that they differ. The bare
   // sentence left the user with nothing to compare against the paper.
   const shekels = value => '₪' + (value / 100).toFixed(2);
@@ -418,7 +421,7 @@ export function tnuvaPaperCheck(input, pageCount) {
   // במפורש נעצר; כותרת שלא נקראה נחשבת תעודה רגילה.
   if (credit) review.push('זו חשבונית זיכוי — יש להזין אותה במסך החזרות, ולא כקליטת סחורה');
   if (returnLines || (returnSummary != null && returnSummary !== 0)) review.push('התעודה כוללת החזרות. יש להפריד אותן לפי תהליך ההחזרות הקיים ולהזין ידנית את נתוני הקליטה');
-  if (!credit && subtotal != null && subtotal <= 0) review.push('סכום התעודה אינו חיובי — יש לבדוק את סוג התעודה');
+  if (!credit && (minusSummary || (subtotal != null && subtotal <= 0))) review.push('סכום התעודה אינו חיובי — כנראה חשבונית זיכוי; יש להזין אותה במסך החזרות, ולא כקליטת סחורה');
   return { ok: problems.length === 0, receivable: !problems.length && !review.length,
     problems, review, missingSummary, retryable: problems.length > 0 && !missingSummary,
     amount: subtotal == null ? null : subtotal / 100, lines: printedLines == null ? null : printedLines,
