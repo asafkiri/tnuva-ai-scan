@@ -938,17 +938,26 @@ function secondStrongEligible(doc, row, field, pageCount) {
 // אף אחת אינה מאשרת?) וגם הקול של הקריאה השנייה נלקחו אז משורה שהיא לא קראה. בשלב 3 בלבד —
 // disputedRows, 2 מתוך 3 וכל השאר של שירות 18 אינם משתנים — קריאה נספרת לשורה המודפסת שנשאלה
 // רק כשיש לה בדיוק שורה אחת באותו עמוד ובאותו מספר שורה מודפס, השורה הזאת נושאת את הקוד של
-// השורה שנבחרה, והקוד הזה מופיע בתעודה בשורה אחת בלבד — גם בקריאה שנבחרה וגם בקריאה הזאת.
-// כל דבר אחר — "לא הותאמה", והקריאה אינה נספרת לשום צד. הקוד כאן רק מזהה את השורה: הוא אינו
-// מוכרע ואינו נמסר.
+// השורה שנבחרה, והקוד הזה מופיע בתעודה בשורה אחת בלבד — גם בקריאה שנבחרה וגם בקריאה הזאת
+// (ומהסבב הרביעי — גם הטבלה שלה מתיישרת, ראו למטה). כל דבר אחר — "לא הותאמה", והקריאה אינה
+// נספרת לשום צד. הקוד כאן רק מזהה את השורה: הוא אינו מוכרע ואינו נמסר.
+// מהביקורת (סבב רביעי): בנייר של תנובה מספרי השורות אינם מודפסים — lineNumber הוא הספירה של
+// הקריאה עצמה. קריאה ששמרה את עמודת הקוד שלמה, אבל הכמות, המחיר והסכום שלה זזו שורה אחת (מספרי
+// השורות הולכים אז אחרי הקודים), נושאת בשורה שנשאלה את הקוד הנכון ואת המספרים של השורה השכנה, והכלל
+// של השורה לבדו מתאים אותה. ההסטה נראית רק בטבלה כולה, ולכן הקריאה נספרת רק כשגם הטבלה שלה מתיישרת
+// עם הטבלה של הקריאה שנבחרה, שורה מול שורה (secondStrongTableDiffers): אותן שורות לפי עמוד ומספר
+// שורה, אף קוד שעבר לשורה אחרת, מספרים בכל שורה, ואותו מחיר יחידה בכל שורה.
 const secondStrongLine = row => Number.isInteger(row && row.lineNumber) && row.lineNumber > 0 ? row.lineNumber : null;
 const secondStrongPage = row => Number.isInteger(row && row.sourcePage) ? row.sourcePage : null;
 const secondStrongCode = row => consensusValue("code", row && row.code) || null;
 const secondStrongRows = doc => doc && Array.isArray(doc.rows) ? doc.rows : [];
 const secondStrongDocOf = (read, noteIndex) => ((read && read.documents) || []).find(item => Number(item && item.noteIndex) === Number(noteIndex)) || null;
 const secondStrongSameLine = (a, b) => secondStrongPage(a) === secondStrongPage(b) && secondStrongLine(a) === secondStrongLine(b);
+const secondStrongNumbers = row => ["quantity", "unitPriceExVat", "lineTotalExVat"]
+  .every(field => row && row[field] != null && row[field] !== "" && Number.isFinite(Number(row[field])));
 // למה השורה שנבחרה אינה ניתנת להתאמה לשורה מודפסת אחת, או null. כשהיא אינה ניתנת להתאמה
-// אף קול אינו יכול להיספר, ולכן אין גם מה לשאול.
+// אף קול אינו יכול להיספר, ולכן אין גם מה לשאול. table_unclear — שורה אחרת בטבלה שנבחרה בלי עמוד
+// או מספר שורה משלה, או בלי כמות, מחיר או סכום: אין מול מה ליישר את הטבלה של קריאה אחרת.
 function secondStrongUnmatchable(doc, row) {
   if (secondStrongLine(row) === null) return "no_line_number";
   if (secondStrongPage(row) === null) return "no_page";
@@ -957,6 +966,36 @@ function secondStrongUnmatchable(doc, row) {
   const rows = secondStrongRows(doc);
   if (rows.filter(item => secondStrongCode(item) === code).length !== 1) return "code_repeated";
   if (rows.filter(item => secondStrongSameLine(item, row)).length !== 1) return "line_repeated";
+  if (rows.some(item => secondStrongLine(item) === null || secondStrongPage(item) === null || !secondStrongNumbers(item)
+    || rows.filter(other => secondStrongSameLine(other, item)).length !== 1)) return "table_unclear";
+  return null;
+}
+// האם הטבלה של קריאה אחרת אינה מתיישרת עם הטבלה שנבחרה (ולמה), או null. otherRow — השורה שלה
+// שהותאמה לשורה שנשאלה; field — השדה שנשאל.
+// - lines_differ: מספר שורות אחר, או שורה של הטבלה שנבחרה שאין לה בדיוק שורה אחת באותו עמוד ומספר.
+//   שורה עודפת או חסרה היא המקום שבו עמודת המספרים יכולה לזוז מול עמודת הקוד.
+// - code_moved: בשורה כלשהי היא קראה קוד שאינו הקוד שנבחר שם, והקוד הזה נמצא במקום אחר — בשורה אחרת
+//   של הטבלה שנבחרה, או בשורה אחרת שלה: עמודת הקוד שלה זזה איפשהו. קוד שלא נקרא, או קוד שאינו מופיע
+//   בשום מקום אחר (טעות בספרה), אינו מזיז דבר — מחלוקת על קוד בשורה אחרת היא סיבה רגילה להסלמה.
+// - numbers_missing: שורה אחרת שלה בלי כמות, מחיר או סכום — שם נשארה המשבצת שהמספרים זזו ממנה.
+//   ערך שלא נקרא בשורה שנשאלה עצמה נשפט שדה-שדה (lone), כמו קודם.
+// - price_differs: בשורה כלשהי מחיר יחידה אחר — מספרים של שורה שכנה (המחיר שנשאל עצמו אינו נבדק).
+// מה שהטבלה אינה יכולה לראות: מספרים שזזו רק על פני שורות באותו מחיר, כשהמשבצת שנשארה התמלאה
+// בשורה האחרונה שנקראה פעמיים או בשורת מספרים נוספת באותו מחיר, בלי קוד שעבר משורה אחרת (README).
+function secondStrongTableDiffers(selectedDoc, row, otherDoc, otherRow, field) {
+  const mine = secondStrongRows(selectedDoc), theirs = secondStrongRows(otherDoc);
+  const at = item => theirs.filter(other => secondStrongSameLine(other, item));
+  if (theirs.length !== mine.length || mine.some(item => at(item).length !== 1)) return "lines_differ";
+  const pairs = mine.map(item => [item, at(item)[0]]);
+  const moved = ([a, b]) => {
+    const code = secondStrongCode(b);
+    if (code === null || code === secondStrongCode(a)) return false;
+    return mine.some(item => secondStrongCode(item) === code) || theirs.some(item => item !== b && secondStrongCode(item) === code);
+  };
+  if (pairs.some(moved)) return "code_moved";
+  if (theirs.some(item => item !== otherRow && !secondStrongNumbers(item))) return "numbers_missing";
+  if (pairs.some(([a, b]) => !(a === row && field === "unitPriceExVat")
+    && consensusValue("unitPriceExVat", a.unitPriceExVat) !== consensusValue("unitPriceExVat", b.unitPriceExVat))) return "price_differs";
   return null;
 }
 // השורה של קריאה אחרת שהיא השורה המודפסת של row: {row}; {seen:false} — הקריאה לא ראתה את המסמך,
@@ -984,13 +1023,17 @@ function secondStrongIneligible(otherDoc, otherRow) {
   return null;
 }
 // מה קריאה אחת ראתה בשדה של השורה המודפסת שנשאלה, כפי שנרשם ב-reads: {stage, value} כשהיא
-// נספרת; {stage, value:null, seen:false} כשלא ראתה את השורה, ועם unmatched כשלא הותאמה; ועם
-// ineligible (והערך שקראה) כשקראה אותה אבל לא כשורת פריטים רגילה של קליטה. counts — האם נספרת.
+// נספרת; {stage, value:null, seen:false} כשלא ראתה את השורה, ועם unmatched כשלא הותאמה — לפי השורה
+// או לפי הטבלה; ועם ineligible (והערך שקראה) כשקראה אותה אבל לא כשורת פריטים רגילה של קליטה.
+// counts — האם נספרת.
 function secondStrongReading(stage, selectedDoc, row, otherDoc, field) {
   const match = secondStrongMatch(selectedDoc, row, otherDoc);
   if (!match.row) return { counts: false, read: { stage, value: null, seen: false, ...(match.unmatched ? { unmatched: match.unmatched } : {}) } };
   const ineligible = secondStrongIneligible(otherDoc, match.row);
-  return { counts: !ineligible, read: { stage, value: match.row[field] ?? null, ...(ineligible ? { ineligible } : {}) } };
+  if (ineligible) return { counts: false, read: { stage, value: match.row[field] ?? null, ineligible } };
+  const table = secondStrongTableDiffers(selectedDoc, row, otherDoc, match.row, field);
+  if (table) return { counts: false, read: { stage, value: null, seen: false, unmatched: table } };
+  return { counts: true, read: { stage, value: match.row[field] ?? null } };
 }
 // התוכנית: אילו שדות הקריאה החזקה השנייה נשאלת עליהם (places), ואילו שדות עמדו בתנאי שירות 18
 // ובתנאי היקף ולא נשאלו, ולמה (notAsked — נרשם ב-C4). selected ו-witnesses הם {stage, scan}.
@@ -1000,10 +1043,10 @@ function secondStrongReading(stage, selectedDoc, row, otherDoc, field) {
 // קריאה זולה לא ראתה בה זיכוי, מינוס או החזרות. מועמד נשאל רק כשכל אלה מתקיימים, כולם לטובת העובד:
 // - השורה שנבחרה ניתנת להתאמה לשורה מודפסת אחת (אחרת not_matchable, ולא קונים קריאה שאינה יכולה להיספר);
 // - אף קריאה זולה לא קראה את השורה המודפסת הזאת כהחזרה או כפיקדון (cheap_not_item_row);
-// - כל קריאה זולה שהושלמה קראה את השורה המודפסת הזאת, באותו קוד, עם ערך בשדה, והן לפחות שתיים
-//   (אחרת lone: קריאה זולה שלא קראה את השדה, או קראה במקומו שורה אחרת, אינה "נחלקה" — ייתכן
-//   שקראה בדיוק כמו האחרת, ושתי קריאות חזקות אינן גוברות על כך; וזולה אחת שהושלמה, כשהאחרת נפלה,
-//   אינה "נחלקו");
+// - כל קריאה זולה שהושלמה קראה את השורה המודפסת הזאת — מותאמת לפי השורה ולפי הטבלה — עם ערך
+//   בשדה, והן לפחות שתיים (אחרת lone: קריאה זולה שלא קראה את השדה, או קראה במקומו שורה אחרת, אינה
+//   "נחלקה" — ייתכן שקראה בדיוק כמו האחרת, ושתי קריאות חזקות אינן גוברות על כך; וזולה אחת שהושלמה,
+//   כשהאחרת נפלה, אינה "נחלקו");
 // - אף אחת מהן לא קראה את הערך של Terra (cheap_confirms — זה 2 מתוך 3, לא שלב 3);
 // - ושום שתיים מהן לא קראו אותו ערך (cheap_agree — שתי זולות שמסכימות הן שלב 1, ו-Terra שחולק
 //   עליהן אינו נעשה צודק כשקריאה חזקה שנייה חוזרת על אותה טעות). עם שתי קריאות זולות: שתיהן
