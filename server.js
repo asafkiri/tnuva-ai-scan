@@ -9,6 +9,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { inspect } from "node:util";
 
 const ALLOWED_ORIGINS = new Set([
   "https://asafkiri.github.io",
@@ -66,9 +67,9 @@ export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // v18: Consensus escalates only on decision fields (a VAT/total sign difference is one; the date is one
 // unless the client sends strongReadSelection:true); the strong read is independent, and when the
 // client sends strongReadSelection:true it must also beat the paper.
-// v19: A quantity or price field the strong read selected and no cheap read confirms gets one more
-// strong read in the checksum-retry slot; if it reads the same value and the paper proves itself,
-// the field is accepted. SECOND_STRONG_READ=off restores service 18.
+// v19: A quantity or price field the strong read selected, on which the cheap reads disagreed and
+// none confirms it, gets one more strong read in the checksum-retry slot; if it reads the same value
+// and the paper proves itself, the field is accepted. SECOND_STRONG_READ=off restores service 18.
 const SERVICE_VERSION = 19;
 // v13: עבודת סריקה נשמרת חצי שעה אחרי שהסתיימה, ושעה לכל היותר מרגע שנפתחה.
 // זה מכסה בנוחות טלפון שנפל וחוזר, ואינו מחזיק זיכרון מעבר לכך.
@@ -912,32 +913,70 @@ function consensusCorrectiveText(diffs, reads = []) {
 //      המודפסים (tnuvaPaperCheck), ובשורה עצמה כמות × מחיר = סכום (tnuvaRowArithmetic).
 // C2 — רק כמות, מחיר יחידה וסכום שורה של שורת פריטים רגילה: לא קוד, לא כוכבית, לא
 //      מקטע, לא קיום שורה, לא שדות סיכום; לא החזרות, לא פיקדון, לא זיכוי ולא נייר
-//      מעורב (כל תעודה שאינה receivable).
+//      מעורב (כל תעודה שאינה receivable) — בכל קריאה, לא רק בזו שנבחרה; ולא שורה
+//      שהזהות שלה פתוחה (ראו scanSecondStrongOpenFields).
 // C3 — ההנחיה נותנת רק מקומות ואת הכשל הידוע, אף פעם לא ערך שנקרא; המודל החזק, מאמץ גבוה.
 // C4 — כל שדה שנסגר כך נרשם ב-consensus.secondStrongRead וביומן invoice_scan_audit,
 //      עם הערך שכל קריאה ראתה.
 // C5 — SECOND_STRONG_READ=off מחזיר את שירות 18 כפי שהיה.
 const SECOND_STRONG_FIELDS = new Set(["quantity", "unitPriceExVat", "lineTotalExVat"]);
 const SECOND_STRONG_RULE = "second_strong_read";
-// C1 + C2 לשדה אחד, מול הקריאה שנבחרה בלבד.
+const secondStrongDeposit = row => /פ.?קדון/.test(String((row && row.description) || ""));
+// C1 + C2 לשדה אחד, מול הקריאה שנבחרה.
 function secondStrongEligible(doc, row, field, pageCount) {
   if (!SECOND_STRONG_FIELDS.has(field) || !doc || !row) return false;
-  if (row.section !== "items" || /פ.?קדון/.test(String(row.description || ""))) return false;
+  if (row.section !== "items" || secondStrongDeposit(row)) return false;
   // receivable = הנייר נסגר וגם אין בו זיכוי, החזרות, מינוס בסיכום או סכום שאינו חיובי.
   return tnuvaPaperCheck(doc, pageCount).receivable === true && tnuvaRowArithmetic(row) === true;
 }
-// השדות שאף עד אינו מאשר והקריאה החזקה השנייה רשאית לסגור. העדים הם אותם עדים של
-// disputedRows (הקריאות הזולות שהושלמו, וקריאת ההכרעה כשאינה זו שנבחרה).
+// השורה של קריאה אחרת שמיושרת מול שורה של הקריאה שנבחרה — אותו יישור בדיוק של diffs
+// (alignConsensusRows על אותן שורות). null — הקריאה לא ראתה את המסמך או את השורה.
+function consensusAlignedRows(selected, other) {
+  const pairs = new Map();
+  for (const doc of (selected && selected.documents) || []) {
+    const noteIndex = Number(doc && doc.noteIndex);
+    const otherDoc = ((other && other.documents) || []).find(item => Number(item && item.noteIndex) === noteIndex);
+    if (!otherDoc) continue;
+    const rowsA = Array.isArray(doc.rows) ? doc.rows : [], rowsB = Array.isArray(otherDoc.rows) ? otherDoc.rows : [];
+    for (const pair of alignConsensusRows(rowsA, rowsB)) {
+      if (pair.a !== null && pair.b !== null) pairs.set(noteIndex + ":" + pair.a, rowsB[pair.b]);
+    }
+  }
+  return (noteIndex, rowIndex) => pairs.get(Number(noteIndex) + ":" + rowIndex) || null;
+}
+// השדות שהקריאה החזקה השנייה רשאית לסגור. witnesses הן הקריאות הזולות שהושלמו — אותם
+// עדים של disputedRows כש-Terra הוא הקריאה שנבחרה (רק אז היא נקראת). מהביקורת, שלושה
+// תנאים נוספים, כולם לטובת העובד:
+// - שלב 3 של הבעלים ("Terra אינו מסכים עם אף אחת מהן") מניח שהזולות נחלקו על השדה. לכן
+//   השדה נשאל רק כשהקריאות הזולות שראו את השורה קראו בו לפחות שני ערכים שונים (null
+//   אינו ערך). שתי זולות שקראו אותו ערך הן שלב 1, ו-Terra שחולק על שתיהן אינו נעשה צודק
+//   כשקריאה חזקה שנייה חוזרת על אותה טעות (שני תאומים באותו מחיר שהכסף שלהם הוחלף —
+//   הנייר עדיין נסגר). כך גם קריאה זולה אחת שהושלמה, כשהשנייה נפלה: אין "נחלקו", ושתי
+//   קריאות חזקות אינן גוברות עליה. השדה אצל העובד, כמו בשירות 18.
+// - שורה שהקוד שלה במחלוקת ואף עד אינו מאשר את הקוד שנבחר (confirmed 0) — הזהות שלה פתוחה,
+//   והכמות והכסף שלה נשארים לעובד יחד עם הקוד. אחרת הכרטיס היה נשאר עם הקוד בלבד, וכלל שתי
+//   הזהויות באותו מחיר של האפליקציה היה סוגר אותו: הקריאה השנייה הייתה מכריעה זהות בעקיפין (C2).
+// - C2 בכל קריאה, לא רק בזו שנבחרה: קריאה זולה שראתה בתעודה זיכוי, מינוס בסיכום או החזרות
+//   (review של tnuvaPaperCheck), או שקראה את השורה כפיקדון או כהחזרה — השדה אינו נשאל.
 export function scanSecondStrongOpenFields(selected, witnesses, inputDocuments) {
   const docs = (selected && selected.documents) || [];
+  const reads = (witnesses || []).filter(Boolean);
+  const alignedRows = reads.map(other => consensusAlignedRows(selected, other));
   const out = [];
-  for (const entry of scanConsensusDisputedRows(selected, witnesses)) {
+  for (const entry of scanConsensusDisputedRows(selected, reads)) {
     const doc = docs.find(item => Number(item && item.noteIndex) === entry.noteIndex);
     const input = (inputDocuments || []).find(item => Number(item && item.noteIndex) === entry.noteIndex);
     const row = doc && Array.isArray(doc.rows) ? doc.rows[entry.rowIndex] : null;
     if (!input || !Array.isArray(input.pages)) continue;
+    if (entry.fields.some(item => item.field === "code" && item.confirmed === 0)) continue;
+    const otherDocs = reads.map(other => ((other && other.documents) || []).find(item => Number(item && item.noteIndex) === entry.noteIndex));
+    if (otherDocs.some(item => item && tnuvaPaperCheck(item, input.pages.length).review.length > 0)) continue;
+    const otherRows = alignedRows.map(rowOf => rowOf(entry.noteIndex, entry.rowIndex)).filter(Boolean);
+    if (otherRows.some(item => item.section !== "items" || secondStrongDeposit(item))) continue;
     for (const item of entry.fields) {
       if (item.confirmed !== 0 || !secondStrongEligible(doc, row, item.field, input.pages.length)) continue;
+      const cheapValues = new Set(otherRows.map(other => consensusValue(item.field, other[item.field])).filter(value => value !== null));
+      if (cheapValues.size < 2) continue;
       out.push({ noteIndex: entry.noteIndex, rowIndex: entry.rowIndex, page: Number.isInteger(row.sourcePage) ? row.sourcePage : null,
         lineNumber: entry.lineNumber, field: item.field });
     }
@@ -2097,7 +2136,16 @@ function decodeAnalyzeClaims(result, aliasToId) {
       // כבוי היא אינה קיימת כלל, והתשובה והיומן הם של שירות 18.
       const secondStrongRead = secondStrongReadOn
         ? { outcome: "not_needed", stage: null, model: null, requestId: null, asked: 0, usage: null, closed: [], open: [] } : null;
-      if (secondStrongRead) scanAudit.secondStrongRead = secondStrongRead;
+      if (secondStrongRead) {
+        scanAudit.secondStrongRead = secondStrongRead;
+        // ב-Cloud Run היומן הוא console (start() אינו מעביר logger), ו-console.info מציג אובייקט
+        // רק עד עומק 2: closed ו-open יצאו שם כ-[Object], בלי המסמך, השורה, השדה ומה כל קריאה
+        // ראתה. ביומן הרשומה מוצגת לכן כשורת JSON אחת ומלאה, עם מזהה הסריקה כדי שהשורה תעמוד
+        // בפני עצמה. המפתח אינו נמנה ואינו עובר ב-JSON, ולכן התשובה אינה משתנה; כשהמתג כבוי
+        // אין רשומה, והיומן הוא של שירות 18.
+        Object.defineProperty(secondStrongRead, inspect.custom, {
+          value: () => JSON.stringify({ scanAuditId: scanAudit.id, ...secondStrongRead }) });
+      }
       const finishScan = (value) => {
         scanAudit.completedAt = now();
         scanAudit.result = !value.ok ? (value.error || 'failed') : value.paperValidation

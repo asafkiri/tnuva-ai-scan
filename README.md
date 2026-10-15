@@ -2,9 +2,9 @@
 
 ## Service 19
 
-Service 19 adds a second strong read. It runs for a field that the strong read
-decided and no cheap read confirms. This is the owner's approved design, live
-with no trial period:
+Service 19 adds a second strong read. It runs for a field that the cheap reads
+disagreed on, that the strong read decided, and that no cheap read confirms.
+This is the owner's approved design, live with no trial period:
 
 1. The two cheap reads agree: the read is accepted, as before.
 2. They disagree: the strong read (`OPENAI_RETRY_MODEL`, Terra) reads the
@@ -21,6 +21,20 @@ Terra#2 only votes for a value. The selected read supplies every value, and
 Terra#2 is never the selected read. Terra#2 never adds a dispute: what it reads
 elsewhere is not compared, and it is not a witness for `missingRows`, for
 `docDateUnconfirmed` or for a code.
+
+**Step 3 needs cheap reads that disagree on that field.** A field is asked
+about only when the cheap reads that saw the row read at least two different
+values in it (a value that was not read, `null`, does not count). This rule
+works per field and per row. The scan may escalate because of a difference
+somewhere else, such as another row's code. If both cheap reads read this field
+alike, that is step 1. Terra disagreeing with both does not make Terra right,
+and a second strong read that repeats the same mistake makes it two against
+two, not a decision. One case shows this: two same-price twins on adjacent rows
+whose quantities and totals Terra swapped. The paper still closes and each row's
+arithmetic still closes, so C1 cannot catch it. The same holds when only one
+cheap read completed because the other one failed: there is no disagreement
+between cheap reads, so two strong reads never outvote the one that
+completed. In both cases the field goes to the worker, as in service 18.
 
 Terra#2 seconds Terra only. When a client sends `strongReadSelection: true`
 and a cheap read is selected because its paper closes better, Terra has
@@ -56,9 +70,19 @@ hold:
   promotion star, the section, the page, a row's existence, the row count, a
   summary field, the returns section, a deposit row (`פיקדון`), a credit note,
   a credit marked only by a minus, and a mixed paper. In practice the selected
-  document must be `receivable`. A code dispute stays exactly as in service
+  document must be `receivable`. This is judged on every read, not only on the
+  selected one. If any cheap read saw a credit note, a minus summary or returns
+  in that document (`review` of `tnuvaPaperCheck`), the document's fields are
+  not asked about. They are not asked about either if any cheap read read the
+  row as a deposit or a returns row. A code dispute stays exactly as in service
   18, `confirmed` count included. That count drives the "manual approval"
   warning and the app's catalog route, so raising it would settle an identity.
+  A row whose identity is still open is not asked about at all. Such a row has
+  a code dispute in which no witness confirms the selected code (`confirmed:
+  0`). Its quantity and money stay with the worker, together with its code. If
+  they closed, the card would hold only the code, and the app's same-price
+  identity rule would settle it on its own. Terra#2 would then decide an
+  identity indirectly, even when its own read of that row named the other code.
 - **C3, independence.** The note carries only locations (document, page,
   printed line, field name) and the known-failure warnings. It carries no
   value from any earlier read. The read uses the same photos and system prompt
@@ -66,14 +90,21 @@ hold:
 - **C4, logging.** `consensus.secondStrongRead` holds
   `{outcome, stage, model, requestId, asked, usage, closed, open}`, plus
   `error` when the call failed. The same object goes to
-  `scanAudit.secondStrongRead` and to the `invoice_scan_audit` log line. Each
-  entry in `closed` names `noteIndex`, `rowIndex`, `page`, `lineNumber`,
-  `field` and the selected `value`, and it carries `rule:
-  "second_strong_read"`. It also lists what every read saw under `reads`
-  (`{stage, value}`, with `seen: false` for a read that did not see the row).
-  `open` lists the fields that were asked about and left for the worker, with
-  `reason` set to `disagrees`, `not_seen` or `failed`. The extra call is an
-  ordinary attempt in `scanAudit.attempts`, with its usage.
+  `scanAudit.secondStrongRead` and to the `invoice_scan_audit` log line. On
+  Cloud Run the logger is `console`, and `console.info` prints an object only
+  to depth 2, so `closed` and `open` would print as `[Object]`. In the log line
+  the record is therefore printed as one line of complete JSON that also
+  carries `scanAuditId`, so the line stands on its own:
+  `secondStrongRead: {"scanAuditId":"…","outcome":"read",…,"closed":[…]}`. The
+  response is unchanged, and with the switch off the record and the line are
+  absent, as in service 18. Each entry in `closed` names `noteIndex`,
+  `rowIndex`, `page`, `lineNumber`, `field` and the selected `value`, and it
+  carries `rule: "second_strong_read"`. It also lists what every read saw under
+  `reads` (`{stage, value}`, with `seen: false` for a read that did not see the
+  row). `open` lists the fields that were asked about and left for the worker,
+  with `reason` set to `disagrees`, `not_seen` or `failed`. The extra call is
+  an ordinary attempt in `scanAudit.attempts`, with its usage, and its usage is
+  also in the record's `usage`, which the log line prints in full.
 - **C5, kill switch.** `SECOND_STRONG_READ=off` (also `false` or `0`) restores
   service 18. With it, the service sends byte-identical model requests and
   returns the same answer, and `secondStrongRead` is absent from the response
