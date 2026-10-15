@@ -1,17 +1,30 @@
-# Tnuva invoice scanner — service 17
+# Tnuva invoice scanner — service 18
 
-Service 17 changes when the paid third read happens, what it is told, and
-what it decides. The two cheap reads now escalate only on a difference in a
-field that feeds a decision in the app: a row's code, quantity, unit price,
-line total, promotion star and section, whether a row exists, the row count,
-and the document number, type, page count, section totals, promotion discount,
-printed line counters and net subtotal. The document date (the owner's
-decision), the page a row was assigned to, the VAT rate, the VAT amount, the
-total including VAT and the rounding difference do not escalate: the app shows
-them as information or a warning and computes with its own VAT setting and the
-printed net. A difference in them is still returned in `consensus.diffs`,
-marked `trigger: false`, and `consensus.agreed` is computed on the other
-differences only — reads that differ only in the date cost one paid call less.
+## Service 18
+
+Service 18 changes when the paid third read happens, what it is told, and —
+for a client that asks for it — what it decides. It is built on service 17
+(below): there is no document number, and an unreadable header is a regular
+document.
+
+The two cheap reads escalate only on a difference in a field that feeds a
+decision in the app: a row's code, quantity, unit price, line total, promotion
+star and section, whether a row exists, the row count, and the document type,
+page count, section totals, promotion discount, printed line counters and net
+subtotal. The document type is compared as service 17 compares it — a credit
+note against anything else — so `invoice` against `unknown` is no difference,
+and the document number is not compared because it is not read. The document
+date (the owner's decision), the page a row was assigned to, the VAT rate, the
+VAT amount, the total including VAT and the rounding difference do not
+escalate: the app shows them as information or a warning and computes with its
+own VAT setting and the printed net. A difference in them is still returned in
+`consensus.diffs`, marked `trigger: false`, and `consensus.agreed` is computed
+on the other differences only — reads that differ only in the date cost one
+paid call less. Together with service 17 this covers the photo whose header
+was cut: under service 17 the type no longer escalated, but the date that was
+usually cut with it still did; now neither does, and the date is named in
+`consensus.docDateUnconfirmed` instead. A minus sign that only one read saw on
+a summary amount is a money difference and still escalates.
 
 Because a date difference no longer buys the retry model, a cheap read can be
 selected with a date nobody settled. The owner's decision is that a date that
@@ -40,42 +53,80 @@ that nothing is confirmed. The service still returns the printed date
 unchanged and escalates, selects and warns exactly as before. The app decides
 which day to use and shows the worker that the day was assumed.
 
-The retry model reads the photo independently. Until service 16 its corrective
+The retry model reads the photo independently. Until service 17 its corrective
 note quoted both earlier values ("read once X and once Y"), and a model handed
 two answers picks between them instead of reading the paper. The note now names
 only where the reads differed — document, page, line number and field name —
 with the known column-shift failure and the instruction to match the printed
-`פריטים` counter. The checksum-retry note (computed against printed totals) is
-unchanged.
+`פריטים` counter. A credit note against a regular document is named as the
+field `docType`, never as the two readings. The checksum-retry note (computed
+against printed totals) is unchanged.
 
-The retry model no longer wins because it is expensive. After a successful
+The retry model no longer wins because it is expensive — when the client says
+it understands that. App 142 sends `"strongReadSelection": true` in the body of
+every request that starts a scan. For such a scan, after a successful
 escalation the server selects, among the cheap reads that completed and the
 retry model's read, the one with the smallest paper error, and a tie goes to
-the retry model. The paper error is the measure the checksum retry compares
-reads by, but it is always taken against the printed paper: the photo-first
-paper check of the printed net subtotal, the `פריטים` counter and the row
-arithmetic. This holds even when the client typed an anchor. Ranking by
-distance to a typed anchor would let a misread that lands near a wrong anchor
-beat the correct reads, skip the stop for a paper that disproves the typed
-anchor, and buy a checksum retry. The typed anchor is checked against the
-selected read afterwards, as before. The measure is counted in whole agorot,
-with a shekel of gap, a line off the counter and each other paper problem
-weighing 100 each, so two reads the same number of agorot off are a true tie
-rather than a floating-point draw. A document whose printed summary was not
-read scores the same fixed penalty plus its problems in every read, instead of
-rewarding the read with fewer rows or a smaller sum. Every read not selected,
-the retry model's included, is a witness for `consensus.disputedRows` and
+the retry model. Without the flag — any app up to 141, or any value other than
+the JSON `true` — a completed escalation is the read returned, exactly as in
+services 16 and 17, and no paper error is recorded. `consensus.strongReadSelection`
+says which rule the scan ran under. The flag is fixed when the scan job starts:
+a resume (`{scanKey, resume: true}`) sends no photos and no flag and collects
+what the job decided, and a duplicate full send with the same key joins the
+running job and gets the same answer whatever it carries. The job key is the
+user and `scanKey` only, so no body field changes which job a resume finds.
+The server does not reject unknown body keys, so services 16 and 17 ignore the
+flag.
+
+The paper error is the measure the checksum retry compares reads by, but it is
+always taken against the printed paper: the photo-first paper check of the
+printed net subtotal, the `פריטים` counter and the row arithmetic. This holds
+even when the client typed an anchor. Ranking by distance to a typed anchor
+would let a misread that lands near a wrong anchor beat the correct reads, skip
+the stop for a paper that disproves the typed anchor, and buy a checksum retry.
+The typed anchor is checked against the selected read afterwards, as before.
+The paper check is service 17's, so a credit note whose title was cut closes in
+absolute value and a mixed paper whose returns exceed its goods closes with its
+own sign: neither costs a read any paper error. The measure is counted in whole
+agorot, with a shekel of gap, a line off the counter and each other paper
+problem weighing 100 each, so two reads the same number of agorot off are a
+true tie rather than a floating-point draw. A document whose printed summary was
+not read scores the same fixed penalty plus its problems in every read, instead
+of rewarding the read with fewer rows or a smaller sum. The checksum retry
+compares a retry against the read it replaces with the same measure for every
+client; the weights are the ones it always had. Every read not selected, the
+retry model's included, is a witness for `consensus.disputedRows` and
 `consensus.missingRows`. `consensus.escalated` and `consensus.escalationModel`
-still say that the third read happened and on which model; the new
+still say that the third read happened and on which model;
 `consensus.escalationSelected` says whether it is the read returned, and
 `scanAudit.attempts[].paperError` records the measure each candidate got, in
-shekels. "Escalated" therefore no longer means "the retry model decided": the
-selected attempt in `scanAudit` says who did.
+shekels. Under the paper rule "escalated" therefore no longer means "the retry
+model decided": the selected attempt in `scanAudit` says who did.
+`consensus.escalationSelected` is reported truthfully under both rules: without
+the flag it is false only when there was no escalation, the escalation failed,
+or the checksum retry replaced the escalation read.
 
 A lone read is no longer silent. When one cheap read failed and the escalation
 failed too, the result has no witness — nothing to disagree with, which looked
 exactly like agreement. It now carries `consensus.unverifiedSingleRead: true`
-and a warning in `scan.warnings`.
+and a warning in `scan.warnings`, for every client.
+
+## Service 17
+
+Service 17 reads no document number: it was removed from the schema, the
+prompt and the comparison of the reads. `docType` is `credit` only when a
+credit note is visible, and `invoice` otherwise, also when the header is cut
+or unreadable. The reads compare it as a credit note against anything else, so
+a cut header no longer buys an escalation, and an unreadable header is a
+regular document that is receivable when its paper closes. Every summary
+amount is returned with its printed sign. Without a visible title, a minus on
+the net subtotal, the items section total, the VAT amount or the total
+including VAT marks a credit note: the paper is checked in absolute value, so a
+corrective read cannot "fix" it by dropping the minus, and it goes to review
+as "probably a credit note" with no paid retry. A mixed paper whose returns
+exceed its goods closes with its own negative sign, also with no retry.
+
+## Earlier services
 
 Rows are compared by content, not by position. Until service 13 the two reads
 of a photo were compared row i against row i, and a document whose reads
@@ -126,8 +177,9 @@ confidence are excluded, because they differ between correct reads. Identical
 reads are accepted with no escalation. Any difference in a decision field — or
 a read that failed, leaving no second opinion — escalates to one call on the
 retry model with a corrective note naming where the reads differed and the
-known column-shift failure; since service 17 the read whose paper closes best
-is selected, ties going to the retry model. Rows the reads disagreed on and no
+known column-shift failure. The escalation read is returned, except that since
+service 18 a client that sends `strongReadSelection: true` gets the read whose
+paper closes best, ties going to the retry model. Rows the reads disagreed on and no
 second read confirms are returned in `consensus.disputedRows` and raise a
 warning, because a paper whose money closes perfectly can still carry an
 identity read from the wrong row. `OPENAI_CONSENSUS_READS=1` restores the
@@ -169,26 +221,29 @@ unchanged.
 `npm test` runs deterministic arithmetic and the actual HTTP handler with
 fixture Firebase signatures and mocked model responses. No paid requests.
 
-Release the app first, then the service. App 140 must not run against service
-17. It words every escalated dispute as "הכריע <model> בקריאה שלישית", and
-under service 17 that can name the retry model when its read lost to a cheap
-read and read the rival value. The user would accept the shown value as the
-retry model's decision when the retry model read the other one. App 141 reads
-`consensus.escalationSelected` and `consensus.unverifiedSingleRead`. When
-service 16 omits them, it falls back to their service-16 meaning: a completed
-escalation was selected, and a lone read is derived from `completedReads`,
-`escalated` and the selected attempt. So it is safe against the service that
-is live now. Service 16 does not send `consensus.docDateUnconfirmed`. There a
-date difference escalates and the retry model's read wins. The `docDate` entry
-in `consensus.diffs` still carries both cheap reads' dates in `values` (first
-cheap read, then second), so app 141 trusts the selected date when a read other
-than the selected one read the same calendar day: either cheap date after a
-completed escalation or a winning checksum retry, and the second cheap date
-when the first cheap read was selected. It takes the selected read from
+The order of release no longer matters. Service 18 selects by the paper only
+for a scan whose request carried `"strongReadSelection": true`, and only app
+142 sends it. App 141 and older word every escalated dispute as "הכריע <model>
+בקריאה שלישית"; against service 18 they keep the old selection, so a completed
+escalation is still the read they are shown, and the wording stays true. The
+rest of service 18 is safe for them: fewer escalations, a corrective note
+without values, a warning on a lone read, and fields they ignore. App 142
+against service 16 or 17: those services ignore the flag and return the
+escalation read. App 142 reads `consensus.escalationSelected` and
+`consensus.unverifiedSingleRead`. When service 16 or 17 omits them, it falls
+back to their service-16 meaning: a completed escalation was selected, and a
+lone read is derived from `completedReads`, `escalated` and the selected
+attempt. Services 16 and 17 do not send `consensus.docDateUnconfirmed`. There
+a date difference escalates and the retry model's read wins. The `docDate`
+entry in `consensus.diffs` still carries both cheap reads' dates in `values`
+(first cheap read, then second), so app 142 trusts the selected date when a
+read other than the selected one read the same calendar day: either cheap date
+after a completed escalation or a winning checksum retry, and the second cheap
+date when the first cheap read was selected. It takes the selected read from
 `scanAudit.attempts` and, without it, from the service-16 meaning of
-`escalated`. Otherwise the date is treated as disputed. Release app 141,
-confirm the store devices show version 141, and only then deploy this source to the
-existing `tnuva-ai-scan` service. `/health` must report `serviceVersion:17`,
+`escalated`. Otherwise the date is treated as disputed. Deploy this source to
+the existing `tnuva-ai-scan` service whenever it is ready, before or after app
+142. `/health` must report `serviceVersion:18`, `strongReadSelection:true`,
 `resumableScans:true`, `photoFirst:true`, `scanAuditVersion:1`,
 `keyStatus:"ready"`, and `retryModel:"gpt-5.6-terra"` — without a retry model
 the escalation runs on the base model and buys nothing.
