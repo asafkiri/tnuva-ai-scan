@@ -760,13 +760,38 @@ export function scanConsensusMissingRows(selected, others, options = {}) {
     .map(({ reads: unused, ...entry }) => entry)
     .sort((a, b) => a.noteIndex - b.noteIndex || a.lineNumber - b.lineNumber);
 }
+// v17: שתי קריאות שקראו אותו יום בשתי צורות (17/09/2026 ו-17.09.2026,
+// 17/09/26, 7.9.2026 מול 07.09.2026, או 2026-09-17) קראו את אותו תאריך. היום
+// מפוענח כמו ב-priceAuditDate של האפליקציה: ISO, או יום/חודש/שנה עם / . או -,
+// ושנה בשתי ספרות או בארבע (בשתי ספרות — 20xx), ותאריך שאינו קיים בלוח אינו
+// יום. רק כשצד אחד אינו מתפענח, המחרוזות (אחרי trim) מושוות כמו ב-diffs.
+// diffs וכללי ההסלמה אינם משתמשים בזה: שם הבדל בצורה נשאר הבדל.
+function consensusDocDay(value) {
+  const text = consensusValue("docDate", value);
+  if (text === null) return null;
+  let match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text), year, month, day;
+  if (match) { year = +match[1]; month = +match[2]; day = +match[3]; }
+  else {
+    match = /^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2}|\d{4})$/.exec(text);
+    if (!match) return null;
+    year = +match[3]; if (year < 100) year += 2000; month = +match[2]; day = +match[1];
+  }
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+    ? date.toISOString().slice(0, 10) : null;
+}
+function consensusSameDocDate(a, b) {
+  const dayA = consensusDocDay(a), dayB = consensusDocDay(b);
+  if (dayA && dayB) return dayA === dayB;
+  return consensusValue("docDate", a) === consensusValue("docDate", b);
+}
 // v17: תאריך שלא נקרא היטב. הבדל בתאריך אינו מסלים עוד, ולכן קריאה זולה
 // שתאריכה שונה מזה של הקריאה המקבילה יכולה להיבחר בלי שאיש הכריע ביניהן.
 // הכרעת בעל החנות: תאריך שלא נקרא היטב — היום. הלקוח משתמש בתאריך הנייר רק
 // כיום שבו נבדקים המחירים ותוקף המבצעים, וצריך לדעת מתי אין לסמוך עליו.
 // המסמכים שמוחזרים כאן הם אלה שקריאה אחרת (מאותן עדות של השורות שבמחלוקת)
 // קראה בהם תאריך אחר, ואף קריאה אחרת אינה מאשרת את התאריך שנבחר. התאריכים
-// מושווים כמו בהשוואת הקריאות (consensusValue), ישירות מהמסמכים — לא מתוך
+// מושווים כיום בלוח השנה (consensusSameDocDate), ישירות מהמסמכים — לא מתוך
 // diffs, שנקטעים אחרי MAX_CONSENSUS_DIFFS. קריאה שלא קראה תאריך (null) או
 // לא קראה את המסמך כלל אינה מאשרת, ולכן נספרת כחולקת. בלי אף עד אין מחלוקת
 // ואין כאן מסמך: unverifiedSingleRead כבר אומר שאף קריאה אינה מאשרת דבר.
@@ -777,10 +802,10 @@ export function scanConsensusDocDateUnconfirmed(selected, others) {
   const out = new Set();
   for (const doc of (selected && selected.documents) || []) {
     const noteIndex = Number(doc && doc.noteIndex);
-    const date = consensusValue("docDate", doc && doc.docDate);
+    const date = doc && doc.docDate;
     const confirmed = reads.some(other => {
       const otherDoc = ((other && other.documents) || []).find(item => Number(item && item.noteIndex) === noteIndex);
-      return Boolean(otherDoc) && consensusValue("docDate", otherDoc.docDate) === date;
+      return Boolean(otherDoc) && consensusSameDocDate(otherDoc.docDate, date);
     });
     if (!confirmed) out.add(noteIndex);
   }

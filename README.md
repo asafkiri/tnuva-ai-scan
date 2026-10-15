@@ -22,11 +22,17 @@ every document where another read read a different date and no other read
 confirms the selected date. "Another read" means the same witnesses as
 `consensus.disputedRows`: every completed cheap read and the retry model's
 read, except the selected one. A checksum-retry read that wins is measured
-against all of them; one that loses is not a witness. Dates are compared the
-way the diff compares them (the string, trimmed), so `7.9.2026` and
-`07.09.2026` count as different. They are compared directly from the
-documents, not taken from `consensus.diffs`, which stops at 200 entries. A read
-that returned no date, or did not return that document, does not confirm.
+against all of them; one that loses is not a witness. Dates are compared as
+calendar days, parsed the way the app's `priceAuditDate` parses them: ISO
+`YYYY-MM-DD`, or day/month/year with `/`, `.` or `-` and a 2- or 4-digit year
+(2-digit means 20xx). So `17/09/2026`, `17.09.2026`, `17/09/26` and
+`2026-09-17` confirm each other, and so do `7.9.2026` and `07.09.2026`. Only
+when one side does not parse as a real day are the trimmed strings compared.
+`consensus.diffs` and the escalation rules are unchanged: there a format-only
+difference is still listed, with `trigger: false`. Dates are compared directly
+from the documents, not taken from `consensus.diffs`, which stops at 200
+entries. A read that returned no date, or did not return that document, does
+not confirm.
 The array is always present. It is empty when consensus was not attempted,
 when the dates agree, and for a lone read. A lone read has no witness, so
 nobody read another date, and `consensus.unverifiedSingleRead` already says
@@ -173,10 +179,15 @@ service 16 omits them, it falls back to their service-16 meaning: a completed
 escalation was selected, and a lone read is derived from `completedReads`,
 `escalated` and the selected attempt. So it is safe against the service that
 is live now. Service 16 does not send `consensus.docDateUnconfirmed`. There a
-date difference escalates and the retry model's read wins, and the response
-does not say whether that date matched either cheap read. A missing field
-therefore means "unknown", not "confirmed". Release app 141, confirm the
-store devices show version 141, and only then deploy this source to the
+date difference escalates and the retry model's read wins. The `docDate` entry
+in `consensus.diffs` still carries both cheap reads' dates in `values` (first
+cheap read, then second), so app 141 trusts the selected date when a read other
+than the selected one read the same calendar day: either cheap date after a
+completed escalation or a winning checksum retry, and the second cheap date
+when the first cheap read was selected. It takes the selected read from
+`scanAudit.attempts` and, without it, from the service-16 meaning of
+`escalated`. Otherwise the date is treated as disputed. Release app 141,
+confirm the store devices show version 141, and only then deploy this source to the
 existing `tnuva-ai-scan` service. `/health` must report `serviceVersion:17`,
 `resumableScans:true`, `photoFirst:true`, `scanAuditVersion:1`,
 `keyStatus:"ready"`, and `retryModel:"gpt-5.6-terra"` — without a retry model

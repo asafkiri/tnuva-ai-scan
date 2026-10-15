@@ -627,6 +627,32 @@ test('v17: the unconfirmed date is read from the documents, not from the capped 
   assert.deepEqual(scanConsensusDocDateUnconfirmed(selected, [null]), []);
 });
 
+test('v17: the same day read in two formats is a confirmed date; diffs still report the difference', async () => {
+  const read = docDate => scan(doc({ docDate }));
+  // אותו יום בלוח: מפריד אחר, שנה בשתי ספרות, אפס מוביל, או ISO.
+  for (const [a, b] of [['17/09/2026', '17.09.2026'], ['17/09/26', '17/09/2026'], ['7.9.2026', '07.09.2026'],
+    ['17-09-2026', '2026-09-17'], ['1.10.26', '01/10/2026']]) {
+    assert.deepEqual(scanConsensusDocDateUnconfirmed(read(a), [read(b)]), [], a + ' / ' + b);
+    assert.deepEqual(scanConsensusDocDateUnconfirmed(read(b), [read(a)]), [], b + ' / ' + a);
+    // ההשוואה בין הקריאות וכללי ההסלמה אינם משתנים: הצורה השונה נשארת הבדל מידע.
+    assert.deepEqual(scanConsensusDiff(read(a), read(b)).map(diff => [diff.field, diff.trigger]), [['docDate', false]]);
+  }
+  // יום אחר, או תאריך שאינו קיים בלוח (31/09, חודש 17), אינו מאשר. כשצד אחד
+  // אינו מתפענח — המחרוזות מושוות כמו קודם.
+  for (const [a, b] of [['17/09/2026', '18.09.2026'], ['17/09/2026', '17/09/2025'], ['17/09/2026', '09/17/2026'],
+    ['31/09/2026', '1/10/2026'], ['17/09/2026', 'ספטמבר 17'], ['17/09/2026', null]]) {
+    assert.deepEqual(scanConsensusDocDateUnconfirmed(read(a), [read(b)]), [0], a + ' / ' + b);
+  }
+  assert.deepEqual(scanConsensusDocDateUnconfirmed(read('ספטמבר 17'), [read(' ספטמבר 17 ')]), []);
+  // מקצה לקצה: שתי הקריאות קראו את אותו יום בשתי צורות — אין הסלמה ואין מחלוקת.
+  const { output, calls } = await request([answer(doc({ docDate: '17/09/2026' })), answer(doc({ docDate: '17.09.2026' }))]);
+  assert.equal(calls.length, 2);
+  assert.equal(output.consensus.agreed, true);
+  assert.deepEqual(output.consensus.diffs.map(diff => diff.field), ['docDate']);
+  assert.deepEqual(output.consensus.docDateUnconfirmed, []);
+  assert.equal(output.scan.documents[0].docDate, '17/09/2026', 'the printed value is returned as read');
+});
+
 test('v17: money, identity and the promotion star still escalate', async () => {
   for (const other of [doc({ subtotalExVat: 50.5 }), doc({ promoDiscountExVat: 1 }), doc({ rows: [row({ lineTotalExVat: 50.1 })] }),
     doc({ rows: [row({ code: '9' })] }), doc({ rows: [row({ promoStar: true })] }), doc({ docDate: '1.9.2026', rows: [row({ quantity: 11 })] })]) {
