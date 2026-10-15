@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { Console } from 'node:console';
 import { Readable, Writable } from 'node:stream';
 import { tnuvaPaperCheck, scanChecksumMismatches, scanConsensusDiff, scanConsensusDisputedRows, scanConsensusMissingRows, scanConsensusDocDateUnconfirmed, alignConsensusRows, OPENAI_NETWORK_RETRY_WINDOW_MS, scanJobKey, scanJobId, createServer,
-  tnuvaRowArithmetic, scanSecondStrongOpenFields, scanSecondStrongReadVotes } from './server.js';
+  tnuvaRowArithmetic, scanSecondStrongOpenFields, scanSecondStrongPlan, scanSecondStrongReadVotes } from './server.js';
 
 const image = 'data:image/jpeg;base64,YQ==';
 const catalog = [{ id: 'milk', name: 'חלב בדיקה', barcode: '7290000000008' }];
@@ -1166,7 +1166,7 @@ test('v19: a quantity Terra read and no cheap read confirms is accepted when a s
     assert.ok(!output.scan.warnings.some(warning => warning.includes('אישור ידני')), label);
     // C4: כל שדה שנסגר — מסמך, שורה (עמוד ומספר מודפס), שדה, מה כל קריאה ראתה, והכלל.
     assert.deepEqual(output.consensus.secondStrongRead, { outcome: 'read', stage: 'second_strong_read', model: 'gpt-5.6-terra', requestId: 'test-4',
-      asked: 2, usage: { input_tokens: 10, output_tokens: 20 }, open: [], closed: [
+      asked: 2, usage: { input_tokens: 10, output_tokens: 20 }, open: [], notAsked: [], closed: [
         { noteIndex: 0, rowIndex: 1, page: 1, lineNumber: 2, field: 'quantity', value: 6, reads: strongReads(6, 13, 17, 6), rule: 'second_strong_read' },
         { noteIndex: 0, rowIndex: 1, page: 1, lineNumber: 2, field: 'lineTotalExVat', value: 30, reads: strongReads(30, 65, 85, 30), rule: 'second_strong_read' }] }, label);
     assert.deepEqual(output.scanAudit.secondStrongRead, output.consensus.secondStrongRead, label);
@@ -1284,19 +1284,30 @@ test('v19 C2: only the quantity and money of an ordinary item row — never the 
   }
   const returnsRead = quantity => doc({ ...mixed(fourRowPaper), rows: mixed(fourRowPaper).rows.map((item, index) => index === 4 ? { ...item, quantity, lineTotalExVat: quantity * 5 } : item) });
   assert.deepEqual(open(mixed(fourRowPaper), returnsRead(3), returnsRead(4)), []);
-  // מקצה לקצה: הכמות והסכום נסגרים, והקוד והכוכבית שבמחלוקת נשארים בדיוק כפי שהיו —
-  // אצל העובד ומול המאגר — גם כשהקריאה השנייה קוראת אותם כמו Terra. הקוד של Terra מאושר כאן
-  // בקריאה זולה אחת: שורה שהזהות שלה פתוחה (confirmed 0) אינה נשאלת כלל — ראו את הבדיקה
-  // "a row whose identity is still open".
+  // מקצה לקצה: הכמות והסכום נסגרים, והכוכבית שבמחלוקת נשארת בדיוק כפי שהייתה — אצל העובד —
+  // גם כשהקריאה השנייה קוראת אותה כמו Terra.
   const { output, calls } = await request([answer(rowTwo({ promoStar: true, quantity: 13, lineTotalExVat: 65 })),
-    answer(rowTwo({ code: '228', promoStar: true, quantity: 17, lineTotalExVat: 85 })), answer(fourRowPaper), answer(fourRowPaper)]);
+    answer(rowTwo({ promoStar: true, quantity: 17, lineTotalExVat: 85 })), answer(fourRowPaper), answer(fourRowPaper)]);
   assert.equal(calls.length, 4);
   const note = calls[3].input[1].content.at(-1).text;
   assert.ok(note.includes('שורה 2: quantity, lineTotalExVat.') && !note.includes('code') && !note.includes('promoStar'), note);
   assert.deepEqual(output.consensus.secondStrongRead.closed.map(item => item.field), ['quantity', 'lineTotalExVat']);
   assert.deepEqual(output.consensus.disputedRows.map(item => [item.rowIndex, item.fields]),
-    [[1, [{ field: 'code', selected: '222', other: '228', confirmed: 1 }, { field: 'promoStar', selected: false, other: true, confirmed: 0 }]]]);
+    [[1, [{ field: 'promoStar', selected: false, other: true, confirmed: 0 }]]]);
   assert.ok(output.scan.warnings.some(warning => warning.includes('אישור ידני')), 'the star still goes to the worker');
+  // וקוד שבמחלוקת נשאר כפי שהיה, עם הכמות והכסף של השורה: מהביקורת (סבב שלישי), קריאה זולה שקראה
+  // בשורה 2 קוד אחר (228) לא קראה את השורה המודפסת של Terra, ולכן אין שתי זולות שנחלקו עליה — השדות
+  // אינם נשאלים (lone). שורה שהזהות שלה פתוחה (confirmed 0) אינה נשאלת ממילא — ראו את הבדיקה
+  // "a row whose identity is still open".
+  const otherCodeResponses = () => [answer(rowTwo({ promoStar: true, quantity: 13, lineTotalExVat: 65 })),
+    answer(rowTwo({ code: '228', promoStar: true, quantity: 17, lineTotalExVat: 85 })), answer(fourRowPaper)];
+  const otherCodeDark = await request(otherCodeResponses(), input, SECOND_OFF);
+  const otherCode = await request([...otherCodeResponses(), answer(fourRowPaper)]);
+  assert.equal(otherCode.calls.length, 3);
+  assert.deepEqual(comparable(otherCode.output), comparable(otherCodeDark.output));
+  assert.deepEqual(otherCode.output.consensus.disputedRows.map(item => [item.rowIndex, item.fields.map(field => [field.field, field.confirmed])]),
+    [[1, [['code', 1], ['quantity', 0], ['lineTotalExVat', 0], ['promoStar', 0]]]]);
+  assert.deepEqual(otherCode.output.consensus.secondStrongRead.notAsked.map(item => [item.field, item.reason]), [['quantity', 'lone'], ['lineTotalExVat', 'lone']]);
   // ונייר זיכוי: אין קריאה רביעית בתשלום.
   const creditRun = await request([answer(credit(lunaThirteen)), answer(credit(lunaSeventeen)), answer(credit(fourRowPaper))]);
   assert.equal(creditRun.calls.length, 3);
@@ -1395,15 +1406,22 @@ test('v19: a row whose identity is still open keeps its quantity and money with 
   assert.equal(lit.output.consensus.secondStrongRead.outcome, 'not_needed');
   assert.deepEqual(lit.output.consensus.disputedRows.map(item => item.fields.map(field => [field.field, field.selected, field.other, field.confirmed])),
     [[['code', '229', '222', 0], ['quantity', 6, 13, 0], ['lineTotalExVat', 30, 65, 0]]]);
-  // הקוד של Terra מאושר בקריאה זולה אחת (2 מתוך 3, שלב 2): הזהות סגורה, ולכן הכמות והסכום
-  // שהזולות נחלקו עליהם ו-Terra לא הסכים עם אף אחת — נשאלים, ונסגרים כשהקריאה השנייה קוראת כמו
-  // Terra. הקוד נשאר ברשימה עם confirmed 1, בדיוק כמו בשירות 18.
-  const settled = await request([answer(lunaThirteen), answer(rowTwo({ code: '229', quantity: 17, lineTotalExVat: 85 })),
-    answer(fourRowPaper), answer(fourRowPaper)]);
-  assert.equal(settled.calls.length, 4);
-  assert.deepEqual(settled.output.consensus.secondStrongRead.closed.map(item => [item.lineNumber, item.field, item.value]),
-    [[2, 'quantity', 6], [2, 'lineTotalExVat', 30]]);
-  assert.deepEqual(settled.output.consensus.disputedRows.map(item => item.fields), [[{ field: 'code', selected: '222', other: '229', confirmed: 1 }]]);
+  // הקוד של Terra מאושר בקריאה זולה אחת (2 מתוך 3, שלב 2): הזהות סגורה. אבל מהביקורת (סבב שלישי)
+  // הקריאה הזולה שקראה בשורה 2 את 229 לא קראה את השורה המודפסת של Terra (קוד אחר באותה שורה), ולכן
+  // אין שתי זולות שנחלקו על הכמות והסכום שלה — הם אינם נשאלים (lone), ונשארים לעובד יחד עם הקוד,
+  // שנשאר ברשימה עם confirmed 1, בדיוק כמו בשירות 18.
+  const settledResponses = () => [answer(lunaThirteen), answer(rowTwo({ code: '229', quantity: 17, lineTotalExVat: 85 })), answer(fourRowPaper)];
+  const settledDark = await request(settledResponses(), input, SECOND_OFF);
+  const settled = await request([...settledResponses(), answer(fourRowPaper)]);
+  assert.equal(settled.calls.length, 3);
+  assert.deepEqual(comparable(settled.output), comparable(settledDark.output));
+  assert.deepEqual(settled.output.consensus.secondStrongRead.notAsked.map(item => [item.lineNumber, item.field, item.reason, item.reads.at(-1)]),
+    [[2, 'quantity', 'lone', { stage: 'consensus_2', value: null, seen: false, unmatched: 'other_code' }],
+      [2, 'lineTotalExVat', 'lone', { stage: 'consensus_2', value: null, seen: false, unmatched: 'other_code' }]]);
+  assert.deepEqual(settled.output.consensus.disputedRows.map(item => item.fields.map(field => [field.field, field.selected, field.other, field.confirmed])),
+    [[['code', '222', '229', 1], ['quantity', 6, 13, 0], ['lineTotalExVat', 30, 65, 0]]]);
+  // כששתי הזולות קראו את השורה המודפסת של Terra (קוד 222) ונחלקו עליה, השדות נשאלים ונסגרים — ראו
+  // את הבדיקה הראשונה של שירות 19.
 });
 
 test('v19 C4: the invoice_scan_audit line that console prints on Cloud Run carries every closed field in full', async () => {
@@ -1507,24 +1525,38 @@ test('v19: the second strong read votes only on the printed row it was asked abo
       [2, 'quantity', 'not_seen', { stage: 'second_strong_read', value: null, seen: false }],
       [2, 'lineTotalExVat', 'not_seen', { stage: 'second_strong_read', value: null, seen: false }]], label);
   }
-  // אותו קוד בשתי השורות: הקוד אינו אומר איזו שורה מודפסת הקריאה השנייה קראה, ולכן הוא אינו
-  // מזהה את השורה — לא נספר, גם כשהשורה המיושרת נושאת אותו קוד.
+  // אותו קוד בשתי השורות: הקוד אינו אומר איזו שורה מודפסת קריאה קראה, ולכן הוא אינו מזהה את
+  // השורה — אף קול אינו יכול להיספר. מהביקורת (סבב שלישי) השדה לכן אינו נשאל כלל, ואין קריאה
+  // רביעית בתשלום (not_matchable, ראו "when the selected row cannot be matched"). ואילו נשאל — הקול
+  // אינו נספר, גם כשהשורה שלה באותו מקום נושאת אותו קוד ואותו ערך.
   const same = ['222', '222'];
-  const places = scanSecondStrongOpenFields(scan(swapped(same)), [scan(cheap(8, same)), scan(cheap(9, same))], input);
-  assert.deepEqual(places.map(item => [item.lineNumber, item.field]), [[2, 'quantity'], [2, 'lineTotalExVat']]);
+  const plan = scanSecondStrongPlan({ stage: 'consensus_escalation', scan: scan(swapped(same)) },
+    [{ stage: 'consensus_1', scan: scan(cheap(8, same)) }, { stage: 'consensus_2', scan: scan(cheap(9, same)) }], input);
+  assert.deepEqual(scanSecondStrongOpenFields(scan(swapped(same)), [scan(cheap(8, same)), scan(cheap(9, same))], input), []);
+  assert.deepEqual(plan.places, []);
+  // שורה 3 (6 בשתי הזולות) — גם היא נושאת את 222, ולכן גם היא אינה ניתנת להתאמה, עוד לפני שהזולות הסכימו.
+  assert.deepEqual(plan.notAsked.map(item => [item.lineNumber, item.field, item.reason, item.unmatched]),
+    [[2, 'quantity', 'not_matchable', 'code_repeated'], [2, 'lineTotalExVat', 'not_matchable', 'code_repeated'],
+      [3, 'quantity', 'not_matchable', 'code_repeated'], [3, 'lineTotalExVat', 'not_matchable', 'code_repeated']]);
+  const places = plan.notAsked.filter(item => item.lineNumber === 2)
+    .map(({ noteIndex, rowIndex, page, lineNumber, field }) => ({ noteIndex, rowIndex, page, lineNumber, field }));
   const votes = extra => scanSecondStrongReadVotes({ stage: 'consensus_escalation', scan: scan(swapped(same)) },
     [{ stage: 'consensus_1', scan: scan(cheap(8, same)) }, { stage: 'consensus_2', scan: scan(cheap(9, same)) }],
     { stage: 'second_strong_read', scan: scan(extra) }, places);
-  assert.deepEqual(votes(skipped(same)).closed, []);
-  assert.deepEqual(votes(skipped(same)).open.map(item => item.reason), ['not_seen', 'not_seen']);
-  // הקריאה השנייה קראה בשורה 2 קוד אחר מזה של Terra: זו לא אותה שורה בעיניה, והקול אינו נספר.
+  for (const extra of [skipped(same), swapped(same)]) {
+    assert.deepEqual(votes(extra).closed, []);
+    assert.deepEqual(votes(extra).open.map(item => [item.reason, item.reads.at(-1)]), [
+      ['not_matched', { stage: 'second_strong_read', value: null, seen: false, unmatched: 'code_repeated' }],
+      ['not_matched', { stage: 'second_strong_read', value: null, seen: false, unmatched: 'code_repeated' }]]);
+  }
+  // הקריאה השנייה קראה בשורה 2 קוד אחר מזה של Terra: זו לא אותה שורה מודפסת, והקול אינו נספר.
   const fourVotes = extra => scanSecondStrongReadVotes({ stage: 'consensus_escalation', scan: scan(fourRowPaper) },
     [{ stage: 'consensus_1', scan: scan(lunaThirteen) }, { stage: 'consensus_2', scan: scan(lunaSeventeen) }],
     { stage: 'second_strong_read', scan: scan(extra) },
     scanSecondStrongOpenFields(scan(fourRowPaper), [scan(lunaThirteen), scan(lunaSeventeen)], input));
   assert.deepEqual(fourVotes(rowTwo({ code: '229' })).open.map(item => [item.field, item.reason, item.reads.at(-1)]), [
-    ['quantity', 'not_seen', { stage: 'second_strong_read', value: null, seen: false }],
-    ['lineTotalExVat', 'not_seen', { stage: 'second_strong_read', value: null, seen: false }]]);
+    ['quantity', 'not_matched', { stage: 'second_strong_read', value: null, seen: false, unmatched: 'other_code' }],
+    ['lineTotalExVat', 'not_matched', { stage: 'second_strong_read', value: null, seen: false, unmatched: 'other_code' }]]);
   // ושורה אחרת שהקריאה השנייה פספסה אינה משנה דבר: השורה שנשאלה קראה אותה, באותו קוד, והיא נסגרת.
   assert.deepEqual(fourVotes(droppedRowPaper).closed.map(item => [item.lineNumber, item.field, item.reads.at(-1)]), [
     [2, 'quantity', { stage: 'second_strong_read', value: 6 }], [2, 'lineTotalExVat', { stage: 'second_strong_read', value: 30 }]]);
@@ -1615,6 +1647,456 @@ test('v19 C5: SECOND_STRONG_READ=off is service 18 — the same requests and the
     assert.equal(status.secondStrongRead, expected, JSON.stringify(extraEnv));
   }
 });
+
+// ===== v19, מהביקורת (סבב שלישי): כל קריאה נספרת רק לשורה המודפסת שנשאלה =====
+// עד כאן "מה קריאה ראתה בשורה שנשאלה" נלקח מהיישור של diffs: לפי מיקום כשמספר השורות שווה,
+// ולפי תוכן כשאינו שווה. קריאה שמשנה סדר, מדלגת על שורה ומכפילה אחרת, או מסיטה את עמודת הקוד
+// מיושרת כך מול שורה מודפסת אחרת — והתנאים של הצד הזול וגם הקול של הקריאה השנייה נלקחו משם.
+// בשלב 3 בלבד: קריאה נספרת לשורה שנשאלה רק כשיש לה בדיוק שורה אחת באותו עמוד ובאותו מספר שורה
+// מודפס, באותו קוד של השורה שנבחרה, וקוד שמופיע בתעודה בשורה אחת בלבד — בקריאה שנבחרה ובשלה.
+// הנייר: ארבע שורות, 98.11 ₪; בשורות 2 ו-3 שני תאומים ב-3.47 — 7 יחידות (24.29) ו-6 (20.82).
+const twinRows = (codes = ['14761056', '14761414']) => [row({ code: '111', lineNumber: 1 }),
+  row({ code: codes[0], lineNumber: 2, quantity: 7, unitPriceExVat: 3.47, lineTotalExVat: 24.29 }),
+  row({ code: codes[1], lineNumber: 3, quantity: 6, unitPriceExVat: 3.47, lineTotalExVat: 20.82 }),
+  row({ code: '444', lineNumber: 4, quantity: 1, unitPriceExVat: 3, lineTotalExVat: 3 })];
+const twinPaper = paper(twinRows());
+const twinRead = rows => doc({ ...twinPaper, rows });
+// הכמות (והסכום בהתאם) של שורה מודפסת אחת.
+const twinQuantity = (quantity, lineNumber = 2, rows = twinRows()) => rows.map(item => item.lineNumber === lineNumber
+  ? { ...item, quantity, lineTotalExVat: Math.round(quantity * 347) / 100 } : item);
+const placesOf = entries => entries.map(item => [item.lineNumber, item.field, item.reason]);
+
+test('v19: a cheap read that skipped a line is not read at a neighbouring line — two cheap reads that read the asked line alike are never outvoted', async () => {
+  // Terra (נבחר, הנייר שלו נסגר) העביר יחידה בין התאומים: שורה 2 = 8, שורה 3 = 5.
+  const moved = twinRead(twinQuantity(5, 3, twinQuantity(8, 2)));
+  assert.equal(tnuvaPaperCheck(moved, 1).receivable, true);
+  // קריאה זולה 1 דילגה על שורה 1 וראתה שורה נוספת בסוף: אותו מספר שורות, ולכן היישור לפי מיקום מצמיד
+  // לשורה 2 של Terra את שורה 3 המודפסת שלה. אבל היא קראה את שורות 2 ו-3 כמו המודפס (7 ו-6), כמו הזולה השנייה.
+  const skipped = twinRead([...twinRows().slice(1), row({ code: '9999', lineNumber: 5, quantity: 2, unitPriceExVat: 1, lineTotalExVat: 2 })]);
+  const exact = twinRead(twinRows().map(item => item.lineNumber === 4 ? { ...item, code: '445' } : item));
+  for (const extraBody of [{}, APP_142]) {
+    const label = JSON.stringify(extraBody);
+    const dark = await request([answer(skipped), answer(exact), answer(moved)], input, SECOND_OFF, extraBody);
+    const lit = await request([answer(skipped), answer(exact), answer(moved), answer(moved)], input, {}, extraBody);
+    // שירות 18: לפי היישור אף זולה אינה מאשרת את 8 ואת 5 — והשדות אצל העובד. כך גם כאן.
+    assert.deepEqual(dark.output.consensus.disputedRows.filter(item => [2, 3].includes(item.lineNumber))
+      .map(item => [item.lineNumber, item.fields.filter(field => field.field === 'quantity').map(field => [field.selected, field.confirmed])]),
+      [[2, [[8, 0]]], [3, [[5, 0]]]], label);
+    assert.equal(lit.calls.length, 3, label + ': no second strong read');
+    assert.deepEqual(lit.calls, dark.calls, label);
+    assert.deepEqual(comparable(lit.output), comparable(dark.output), label);
+    const record = lit.output.consensus.secondStrongRead;
+    assert.deepEqual([record.outcome, record.asked, record.closed, record.open], ['not_needed', 0, [], []], label);
+    // C4: למה לא נשאל — שתי הזולות קראו את השורה המודפסת הזאת, באותו קוד, באותו ערך.
+    assert.deepEqual(record.notAsked.map(item => [item.lineNumber, item.field, item.reason, item.reads.map(read => read.value)]), [
+      [2, 'quantity', 'cheap_agree', [8, 7, 7]], [2, 'lineTotalExVat', 'cheap_agree', [27.76, 24.29, 24.29]],
+      [3, 'quantity', 'cheap_agree', [5, 6, 6]], [3, 'lineTotalExVat', 'cheap_agree', [17.35, 20.82, 20.82]]], label);
+    assert.deepEqual(record.notAsked[0].reads.map(read => read.stage), ['consensus_escalation', 'consensus_1', 'consensus_2'], label);
+  }
+});
+
+test('v19: a cheap reading that was not read or not matched leaves its field with the worker — field by field', async () => {
+  // קריאה זולה 1 לא קראה את הכמות בשורה 2, רק את הסכום. הכמות — קריאה זולה אחת, אצל העובד; הסכום, שבו
+  // שתי הזולות נחלקו, נשאל ונסגר.
+  const noQuantity = rowTwo({ quantity: null, lineTotalExVat: 65 });
+  const dark = await request([answer(noQuantity), answer(lunaSeventeen), answer(fourRowPaper)], input, SECOND_OFF);
+  const lit = await request([answer(noQuantity), answer(lunaSeventeen), answer(fourRowPaper), answer(fourRowPaper)]);
+  assert.equal(lit.calls.length, 4);
+  const note = lit.calls[3].input[1].content.at(-1).text;
+  assert.ok(note.includes('שורה 2: lineTotalExVat.') && !note.includes('quantity'), note);
+  const record = lit.output.consensus.secondStrongRead;
+  assert.deepEqual(record.closed.map(item => [item.lineNumber, item.field, item.value]), [[2, 'lineTotalExVat', 30]]);
+  assert.deepEqual(record.notAsked.map(item => [item.lineNumber, item.field, item.reason, item.reads.map(read => read.value)]),
+    [[2, 'quantity', 'lone', [6, null, 17]]]);
+  assert.deepEqual(lit.output.consensus.disputedRows.map(item => item.fields),
+    [dark.output.consensus.disputedRows[0].fields.filter(field => field.field !== 'lineTotalExVat')]);
+  // קריאה זולה 1 קראה בשורה 2 את הקוד של שורה 3 (הסטה של עמודת הקוד): זו לא השורה המודפסת שנשאלה.
+  // לפי היישור הקוד של Terra עדיין מאושר בזולה 2, אבל בשלב 3 נשארה רק קריאה זולה אחת של השורה —
+  // אין "נחלקו", ואין קריאה רביעית בתשלום.
+  const shifted = rowTwo({ code: '333', quantity: 13, lineTotalExVat: 65 });
+  const shiftedDark = await request([answer(shifted), answer(lunaSeventeen), answer(fourRowPaper)], input, SECOND_OFF);
+  const shiftedLit = await request([answer(shifted), answer(lunaSeventeen), answer(fourRowPaper), answer(fourRowPaper)]);
+  assert.deepEqual(shiftedDark.output.consensus.disputedRows.map(item => item.fields.map(field => [field.field, field.confirmed])),
+    [[['code', 1], ['quantity', 0], ['lineTotalExVat', 0]]]);
+  assert.equal(shiftedLit.calls.length, 3);
+  assert.deepEqual(shiftedLit.calls, shiftedDark.calls);
+  assert.deepEqual(comparable(shiftedLit.output), comparable(shiftedDark.output));
+  const shiftedRecord = shiftedLit.output.consensus.secondStrongRead;
+  assert.equal(shiftedRecord.outcome, 'not_needed');
+  assert.deepEqual(placesOf(shiftedRecord.notAsked), [[2, 'quantity', 'lone'], [2, 'lineTotalExVat', 'lone']]);
+  assert.deepEqual(shiftedRecord.notAsked[0].reads, [{ stage: 'consensus_escalation', value: 6, selected: true },
+    { stage: 'consensus_1', value: null, seen: false, unmatched: 'other_code' }, { stage: 'consensus_2', value: 17 }]);
+});
+
+test('v19: the second strong read counts only with its own single row at the asked page and line, under the same code printed once — a shifted code column or a doubled line confirms nothing', async () => {
+  // הזולות נחלקו על שורה 2 (8 ו-9) וקראו את שורה 3 כמו המודפס. Terra החליף בין התאומים (6 ו-7):
+  // הנייר שלו והחשבון של כל שורה עדיין נסגרים, והקוד של כל שורה מאושר בשתי הזולות.
+  const cheap = quantity => twinRead(twinQuantity(quantity));
+  const swapped = twinRead(twinQuantity(7, 3, twinQuantity(6, 2)));
+  const responses = () => [answer(cheap(8)), answer(cheap(9)), answer(swapped)];
+  const dark = await request(responses(), input, SECOND_OFF, APP_142);
+  assert.deepEqual(dark.output.consensus.disputedRows.map(item => item.lineNumber), [2, 3]);
+  const p = twinRows();
+  // הקריאה הרביעית קוראת את כל הכמויות נכון — בשורה 2: 7 — אבל לא את השורה המודפסת 2 של Terra.
+  const variants = [
+    // הכשל הידוע: עמודת הקוד הוסטה שורה אחת למטה, ונוספה שורה בסוף (מספר שורות שונה — יישור לפי תוכן).
+    ['code column shifted, one extra row', [p[0], { ...p[1], code: '5' }, { ...p[2], code: '14761056' }, { ...p[3], code: '14761414' }, { ...p[3], code: '444', lineNumber: 5 }], 'other_code'],
+    ['code column shifted, same row count', [p[0], { ...p[1], code: '5' }, { ...p[2], code: '14761056' }, { ...p[3], code: '14761414' }], 'other_code'],
+    ['code column shifted, the leftover code on a row without numbers', [{ ...p[0], code: null }, { ...p[1], code: '111' }, { ...p[2], code: '14761056' },
+      { ...p[3], code: '14761414' }, row({ code: '444', lineNumber: 5, quantity: null, unitPriceExVat: null, lineTotalExVat: null })], 'other_code'],
+    ['code column shifted, first row dropped', [{ ...p[1], code: '111' }, { ...p[2], code: '14761056' }, { ...p[3], code: '14761414' }], 'other_code'],
+    // שתי שורות שהיא מספרה 2: אי אפשר לדעת איזו מהן היא השורה המודפסת.
+    ['two rows numbered 2', [p[0], p[1], { ...p[2], lineNumber: 2 }, p[3]], 'line_repeated'],
+    // אותו קוד בשתי שורות שלה: הקוד אינו אומר איזו שורה מודפסת קראה.
+    ['the asked code on two of its rows', [p[0], p[1], { ...p[2], code: '14761056' }, p[3]], 'code_repeated'],
+  ];
+  for (const [label, rows, why] of variants) {
+    const extra = twinRead(rows);
+    assert.equal(extra.rows.find(item => item.lineNumber === 2).quantity, 7, label);
+    const lit = await request([...responses(), answer(extra)], input, {}, APP_142);
+    assert.equal(lit.calls.length, 4, label);
+    assert.ok(lit.calls[3].input[1].content.at(-1).text.includes('שורה 2: quantity, lineTotalExVat.'), label);
+    assert.equal(lit.output.consensus.escalationSelected, true, label);
+    assert.deepEqual(lit.output.consensus.disputedRows, dark.output.consensus.disputedRows, label);
+    assert.deepEqual(lit.output.scan, dark.output.scan, label);
+    const record = lit.output.consensus.secondStrongRead;
+    assert.deepEqual(record.closed, [], label);
+    // C4: הקריאה הרביעית לא נספרה, ולמה.
+    const vote = { stage: 'second_strong_read', value: null, seen: false, unmatched: why };
+    assert.deepEqual(record.open.map(item => [item.lineNumber, item.field, item.reason, item.reads.at(-1)]),
+      [[2, 'quantity', 'not_matched', vote], [2, 'lineTotalExVat', 'not_matched', vote]], label);
+    // שורה 3 לא נשאלה: שתי הזולות קראו בה 6.
+    assert.deepEqual(placesOf(record.notAsked), [[3, 'quantity', 'cheap_agree'], [3, 'lineTotalExVat', 'cheap_agree']], label);
+  }
+  // ביקורת: אותה שורה מודפסת, באותו קוד, כמו המודפס — 7 מול 6 של Terra: "disagrees", לא "not_matched".
+  const exact = await request([...responses(), answer(twinRead(twinRows()))], input, {}, APP_142);
+  assert.deepEqual(exact.output.consensus.secondStrongRead.open.map(item => [item.field, item.reason, item.reads.at(-1)]), [
+    ['quantity', 'disagrees', { stage: 'second_strong_read', value: 7 }], ['lineTotalExVat', 'disagrees', { stage: 'second_strong_read', value: 24.29 }]]);
+});
+
+test('v19: when the selected row cannot be matched to one printed line — a code printed twice, no code, no line number — no second strong read is bought', async () => {
+  // הזולות נחלקו על שורה 2 (8 ו-9), ו-Terra (וגם קריאה רביעית, אילו נקנתה) קרא את הנייר בדיוק.
+  const cases = [
+    // אותו מוצר מודפס בשתי שורות.
+    ['code_repeated', twinRows(['222', '222']), rows => rows],
+    // הקוד בשורה 2 לא נקרא — ב-Terra ובקריאה הזולה הראשונה (ולכן הוא "מאושר" שם).
+    ['no_code', twinRows([null, '14761414']), (rows, index) => index === 1 ? rows.map(item => item.lineNumber === 2 ? { ...item, code: '14761056' } : item) : rows],
+    // Terra לא קרא את מספר השורה.
+    ['no_line_number', twinRows().map(item => item.lineNumber === 2 ? { ...item, lineNumber: null } : item), () => twinRows()],
+  ];
+  for (const [why, terraRows, cheapRows] of cases) {
+    const cheap = (quantity, index) => twinRead(twinQuantity(quantity, 2, cheapRows(terraRows.map(item => ({ ...item, lineNumber: item.lineNumber ?? 2 })), index)));
+    const terra = twinRead(terraRows);
+    assert.equal(tnuvaPaperCheck(terra, 1).receivable, true, why);
+    const responses = () => [answer(cheap(8, 0)), answer(cheap(9, 1)), answer(terra)];
+    const dark = await request(responses(), input, SECOND_OFF, APP_142);
+    const lit = await request([...responses(), answer(terra)], input, {}, APP_142);
+    assert.ok(dark.output.consensus.disputedRows.some(item => item.fields.some(field => field.field === 'quantity' && field.confirmed === 0)), why);
+    assert.equal(lit.calls.length, 3, why + ': nothing a second strong read could settle');
+    assert.deepEqual(lit.calls, dark.calls, why);
+    assert.deepEqual(comparable(lit.output), comparable(dark.output), why);
+    const record = lit.output.consensus.secondStrongRead;
+    assert.deepEqual([record.outcome, record.asked, record.closed, record.open], ['not_matchable', 0, [], []], why);
+    assert.deepEqual(record.notAsked.map(item => [item.lineNumber, item.field, item.reason, item.unmatched]),
+      [[2, 'quantity', 'not_matchable', why], [2, 'lineTotalExVat', 'not_matchable', why]], why);
+  }
+});
+
+test('v19 with three cheap reads: every completed cheap read must read the asked line, and no two of them alike', async () => {
+  const THREE = { OPENAI_CONSENSUS_READS: '3' };
+  const cheap = quantity => twinRead(twinQuantity(quantity));
+  // Terra העביר יחידה בין התאומים: 8 ו-5. בשורה 3 כל הזולות קראו 6.
+  const terra = twinRead(twinQuantity(5, 3, twinQuantity(8, 2)));
+  // שתי זולות קראו בשורה 2 את 7 (המודפס), השלישית 9: זה שלב 1 (שתיים מסכימות), לא שלב 3.
+  const agree = () => [answer(cheap(7)), answer(cheap(9)), answer(cheap(7)), answer(terra)];
+  const dark = await request(agree(), input, { ...THREE, ...SECOND_OFF }, APP_142);
+  const lit = await request([...agree(), answer(terra)], input, THREE, APP_142);
+  assert.equal(lit.output.consensus.escalationSelected, true);
+  assert.equal(lit.calls.length, 4, 'three cheap reads and the escalation, nothing more');
+  assert.deepEqual(lit.calls, dark.calls);
+  assert.deepEqual(comparable(lit.output), comparable(dark.output));
+  const record = lit.output.consensus.secondStrongRead;
+  assert.equal(record.outcome, 'not_needed');
+  assert.deepEqual(record.notAsked.map(item => [item.lineNumber, item.field, item.reason, item.reads.map(read => read.value)]), [
+    [2, 'quantity', 'cheap_agree', [8, 7, 9, 7]], [2, 'lineTotalExVat', 'cheap_agree', [27.76, 24.29, 31.23, 24.29]],
+    [3, 'quantity', 'cheap_agree', [5, 6, 6, 6]], [3, 'lineTotalExVat', 'cheap_agree', [17.35, 20.82, 20.82, 20.82]]]);
+  // שלוש קריאות שונות (7, 9 ו-10): נשאל, ו-Terra#2 שקרא 8 סוגר.
+  const spread = await request([answer(cheap(7)), answer(cheap(9)), answer(cheap(10)), answer(terra), answer(terra)], input, THREE, APP_142);
+  assert.equal(spread.calls.length, 5);
+  assert.deepEqual(spread.output.consensus.secondStrongRead.closed.map(item => [item.lineNumber, item.field, item.reads.map(read => read.value)]), [
+    [2, 'quantity', [8, 7, 9, 10, 8]], [2, 'lineTotalExVat', [27.76, 24.29, 31.23, 34.7, 27.76]]]);
+  // זולה שלישית שנכשלה אינה עד: שתי הזולות שהושלמו קראו את השורה, ונחלקו (7 ו-9) — נשאל ונסגר.
+  const failed = await request([answer(cheap(7)), answer(cheap(9)), { output_text: 'invalid json' }, answer(terra), answer(terra)], input, THREE, APP_142);
+  assert.equal(failed.output.consensus.reason, 'read_failed');
+  assert.equal(failed.calls.length, 5);
+  assert.deepEqual(failed.output.consensus.secondStrongRead.closed.map(item => [item.field, item.reads.map(read => read.value)]), [
+    ['quantity', [8, 7, 9, 8]], ['lineTotalExVat', [27.76, 24.29, 31.23, 27.76]]]);
+  // זולה שלישית שקראה בשורה 2 קוד אחר לא קראה את השורה המודפסת הזאת — אבל ייתכן שקראה את 7 או את 9
+  // במקום אחר. השדה אינו נשאל, והקוד שבמחלוקת נשאר בדיוק כמו בשירות 18.
+  const otherCode = twinRead(twinQuantity(10).map(item => item.lineNumber === 2 ? { ...item, code: '5' } : item));
+  const thirdResponses = () => [answer(cheap(7)), answer(cheap(9)), answer(otherCode), answer(terra)];
+  const thirdDark = await request(thirdResponses(), input, { ...THREE, ...SECOND_OFF }, APP_142);
+  const third = await request([...thirdResponses(), answer(terra)], input, THREE, APP_142);
+  assert.equal(third.calls.length, 4);
+  assert.deepEqual(comparable(third.output), comparable(thirdDark.output));
+  const thirdRecord = third.output.consensus.secondStrongRead;
+  assert.deepEqual(thirdRecord.notAsked.filter(item => item.lineNumber === 2).map(item => [item.field, item.reason,
+    item.reads.map(read => read.seen === false ? read.unmatched : read.value)]), [
+    ['quantity', 'lone', [8, 7, 9, 'other_code']], ['lineTotalExVat', 'lone', [27.76, 24.29, 31.23, 'other_code']]]);
+  assert.deepEqual(third.output.consensus.disputedRows.filter(item => item.lineNumber === 2).map(item => item.fields.map(field => [field.field, field.confirmed])),
+    [[['code', 2], ['quantity', 0], ['lineTotalExVat', 0]]]);
+});
+
+test('v19 C2 on the second strong read too: a vote from a read that saw a credit note, a minus, returns or a deposit row does not count', async () => {
+  const credit = item => doc({ ...item, docType: 'credit', subtotalExVat: -91, vatAmount: -16.38, totalInclVat: -107.38 });
+  const minus = item => doc({ ...item, subtotalExVat: -91 });
+  const withReturns = item => doc({ ...item, rows: [...item.rows, row({ section: 'returns', lineNumber: 5, quantity: 2, lineTotalExVat: 10 })] });
+  const asDeposit = item => doc({ ...item, rows: item.rows.map((each, index) => index === 1 ? { ...each, description: 'פיקדון בקבוק' } : each) });
+  const dark = await request([answer(lunaThirteen), answer(lunaSeventeen), answer(fourRowPaper)], input, SECOND_OFF);
+  for (const [kind, why] of [[credit, 'credit_or_returns'], [minus, 'credit_or_returns'], [withReturns, 'credit_or_returns'], [asDeposit, 'deposit_row']]) {
+    // היא קראה בשורה 2 בדיוק את מה ש-Terra קרא (6 ו-30), אבל לא כשורת פריטים רגילה של קליטה.
+    const lit = await request([answer(lunaThirteen), answer(lunaSeventeen), answer(fourRowPaper), answer(kind(fourRowPaper))]);
+    assert.equal(lit.calls.length, 4, kind.name);
+    const record = lit.output.consensus.secondStrongRead;
+    assert.deepEqual(record.closed, [], kind.name);
+    assert.deepEqual(record.open.map(item => [item.field, item.reason, item.reads.at(-1)]), [
+      ['quantity', 'not_eligible', { stage: 'second_strong_read', value: 6, ineligible: why }],
+      ['lineTotalExVat', 'not_eligible', { stage: 'second_strong_read', value: 30, ineligible: why }]], kind.name);
+    assert.deepEqual(lit.output.scan, dark.output.scan, kind.name);
+    assert.deepEqual(lit.output.consensus.disputedRows, dark.output.consensus.disputedRows, kind.name);
+  }
+});
+
+// ===== v19, מהביקורת (סבב שלישי): הפאזר של הביקורת =====
+// אותן תשובות של המודל, המתג דלוק וכבוי, ולכל שדה שנשאל — בדיקה מול האמת: כל שורה מודפסת נושאת
+// תג (p#n בתיאור) שעובר איתה בכל טעות של הקריאה — שורה שהושמטה, הוכפלה, פוצלה, הוזזה או שהקוד שלה
+// הוסט — ולכן ידוע איזו שורה מודפסת כל קריאה קראה באמת. התשובה לכל קריאה נבחרת לפי השלב שלה (מההנחיה
+// שבסוף הבקשה), לא לפי סדר. ערך שגוי שנסגר כששתי הקריאות החזקות טעו אותו דבר וכל התנאים מתקיימים
+// הוא הסיכון שהבעלים קיבל, ולכן אינו נספר כאן; כל הפרה של כלל — כן.
+const fuzzStageOf = call => {
+  const last = call.input[1].content.at(-1);
+  const text = last.type === 'input_text' ? last.text : '';
+  if (call.model === 'gpt-5.6-luna') return 'cheap';
+  if (text.startsWith('שתי קריאות קודמות') || text.startsWith('קריאה מקבילה של אותו צילום')) return 'escalation';
+  if (text.startsWith('אזהרת סכום ביקורת')) return 'checksum_retry';
+  if (text.startsWith('קריאות קודמות של אותו צילום לא אישרו')) return 'second_strong_read';
+  return 'unknown';
+};
+async function stagedRequest(reads, documents, extraEnv, extraBody) {
+  const calls = [];
+  let cheapIndex = 0;
+  const server = createServer({ env: { OPENAI_API_KEY: 'fixture-only', OPENAI_MODEL: 'gpt-5.6-luna',
+    OPENAI_RETRY_MODEL: 'gpt-5.6-terra', OPENAI_RETRY_SERVICE_TIER: 'priority', ...extraEnv },
+    logger: { info() {}, error: error => { throw error; } },
+    fetchImpl: async (url, options) => {
+      if (url.includes('googleapis.com')) return Response.json({ keys: [jwk] });
+      const call = JSON.parse(options.body); calls.push(call);
+      const stage = fuzzStageOf(call);
+      const read = stage === 'cheap' ? reads.cheap[cheapIndex++] : stage === 'escalation' ? reads.escalation : reads.fourth;
+      assert.ok(read !== undefined, 'no read for ' + stage);
+      return Response.json({ output_text: read === 'fail' ? 'invalid json' : JSON.stringify({ documents: read, warnings: [] }),
+        model: call.model, id: 'test-' + calls.length, usage: { input_tokens: 10, output_tokens: 20 } });
+    } });
+  const output = await sendScan(server, { documents, catalog: [], ...extraBody }).ended;
+  server.close();
+  return { output, calls, stages: calls.map(fuzzStageOf) };
+}
+function fuzzRandom(seed) {
+  let s = Math.imul(seed, 2654435761) >>> 0 || 1; // זרעים סמוכים — רצפים שאינם דומים זה לזה
+  const next = () => { s ^= s << 13; s >>>= 0; s ^= s >> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; };
+  for (let index = 0; index < 8; index += 1) next();
+  return { int: (a, b) => a + Math.floor(next() * (b - a + 1)), pick: list => list[Math.floor(next() * list.length)], chance: p => next() < p };
+}
+const r2 = value => Math.round(value * 100) / 100;
+const fuzzTag = item => { const match = /p#(\d+)/.exec(String((item && item.description) || '')); return match ? Number(match[1]) : null; };
+const fuzzClone = value => JSON.parse(JSON.stringify(value));
+const fuzzFix = item => { item.lineTotalExVat = r2(item.quantity * item.unitPriceExVat); };
+function fuzzPaper(rows, { noteIndex = 0, docType = 'invoice', sign = 1 } = {}) {
+  const items = rows.filter(item => item.section === 'items'), returns = rows.filter(item => item.section === 'returns');
+  const itemsTotal = r2(items.reduce((sum, item) => sum + item.lineTotalExVat, 0)), returnsTotal = r2(returns.reduce((sum, item) => sum + item.lineTotalExVat, 0));
+  const subtotal = r2((itemsTotal - returnsTotal) * sign), vat = r2(subtotal * .18);
+  return doc({ noteIndex, docType, itemsPrintedLines: items.length, returnsSectionTotalExVat: returns.length ? returnsTotal : null,
+    returnsPrintedLines: returns.length || null, subtotalExVat: subtotal, vatAmount: vat, totalInclVat: r2(subtotal + vat),
+    rows: rows.map((item, index) => ({ ...item, lineNumber: index + 1 })) });
+}
+// נייר מודפס: 'plain', 'repeat' (קוד אחד בשתי שורות), 'deposit', 'mixed' (עם החזרות) או 'credit'.
+function fuzzPrinted(R, kind, noteIndex = 0) {
+  const rows = [];
+  for (let index = 0, n = R.int(2, 6); index < n; index += 1) {
+    const unit = R.pick([3.47, 3.47, 5, 4, 2.5, 12.9]), quantity = R.int(1, 12);
+    rows.push(row({ code: String(1000 + index * 111 + R.int(0, 9)), description: 'p#' + index + ' מוצר', quantity, unitPriceExVat: unit, lineTotalExVat: r2(quantity * unit) }));
+  }
+  const n = rows.length;
+  // תאומים: לעיתים קרובות שתי שורות סמוכות באותו מחיר.
+  if (n >= 3 && R.chance(.7)) { const i = R.int(0, n - 2); rows[i + 1].unitPriceExVat = rows[i].unitPriceExVat; fuzzFix(rows[i + 1]); }
+  if (kind === 'repeat') { const i = R.int(0, n - 2), j = R.int(i + 1, n - 1); rows[j].code = rows[i].code; rows[j].unitPriceExVat = rows[i].unitPriceExVat; fuzzFix(rows[j]); }
+  if (kind === 'deposit') { const i = R.int(0, n - 1); rows[i].description = 'פיקדון p#' + i; rows[i].unitPriceExVat = .3; fuzzFix(rows[i]); }
+  if (kind === 'mixed') rows.push(row({ section: 'returns', code: '9990', description: 'p#' + n + ' החזרה', quantity: 2, unitPriceExVat: 5, lineTotalExVat: 10 }));
+  return fuzzPaper(rows, { noteIndex, ...(kind === 'credit' ? { docType: 'credit', sign: -1 } : {}) });
+}
+const fuzzSamePrice = rows => {
+  const pairs = [];
+  rows.forEach((a, i) => rows.forEach((b, j) => { if (i < j && a.section === 'items' && b.section === 'items' && a.unitPriceExVat === b.unitPriceExVat) pairs.push([i, j]); }));
+  return pairs;
+};
+const FUZZ_MUTATIONS = {
+  qty(R, d) { const item = R.pick(d.rows), k = R.pick([-3, -2, -1, 1, 2, 3, 4]); if (item.quantity + k < 0) return; item.quantity += k; if (R.chance(.8)) fuzzFix(item); },
+  swap(R, d) { const pairs = fuzzSamePrice(d.rows); if (!pairs.length) return; const [i, j] = R.pick(pairs), a = d.rows[i], b = d.rows[j];
+    [a.quantity, b.quantity] = [b.quantity, a.quantity]; [a.lineTotalExVat, b.lineTotalExVat] = [b.lineTotalExVat, a.lineTotalExVat]; },
+  comp(R, d) { const pairs = fuzzSamePrice(d.rows); if (!pairs.length) return; const [i, j] = R.pick(pairs), k = R.int(1, 3); if (d.rows[j].quantity - k < 0) return;
+    d.rows[i].quantity += k; d.rows[j].quantity -= k; fuzzFix(d.rows[i]); fuzzFix(d.rows[j]); },
+  drop(R, d) { if (d.rows.length > 1) d.rows.splice(R.int(0, d.rows.length - 1), 1); },
+  dup(R, d) { const i = R.int(0, d.rows.length - 1); d.rows.splice(i + 1, 0, fuzzClone(d.rows[i])); },
+  dropDup(R, d) { if (d.rows.length < 3) return; d.rows.splice(R.int(0, d.rows.length - 2), 1); const j = R.int(0, d.rows.length - 1); d.rows.splice(j + 1, 0, fuzzClone(d.rows[j])); },
+  dropAdd(R, d) { if (d.rows.length < 3) return; d.rows.splice(R.int(0, d.rows.length - 2), 1);
+    d.rows.push(row({ code: String(7000 + R.int(0, 99)), description: 'phantom', quantity: R.int(1, 9), unitPriceExVat: 3.47 })); fuzzFix(d.rows.at(-1)); },
+  split(R, d) { const i = R.int(0, d.rows.length - 1), item = d.rows[i]; if (item.quantity < 2) return; const q = R.int(1, item.quantity - 1);
+    const a = { ...item, quantity: q }, b = { ...item, quantity: item.quantity - q }; fuzzFix(a); fuzzFix(b); d.rows.splice(i, 1, a, b); },
+  codeShift(R, d) { if (d.rows.length < 2) return; const from = R.int(0, d.rows.length - 2), codes = d.rows.map(item => item.code);
+    if (R.chance(.5)) { for (let i = from + 1; i < d.rows.length; i += 1) d.rows[i].code = codes[i - 1]; return; }
+    for (let i = from; i < d.rows.length - 1; i += 1) d.rows[i].code = codes[i + 1]; d.rows.at(-1).code = null; },
+  codeMis(R, d) { const i = R.int(0, d.rows.length - 1), others = d.rows.filter((item, j) => j !== i && item.code).map(item => item.code);
+    d.rows[i].code = others.length && R.chance(.5) ? R.pick(others) : String(5000 + R.int(0, 999)); },
+  codeNull(R, d) { R.pick(d.rows).code = null; },
+  unitMis(R, d) { const item = R.pick(d.rows); item.unitPriceExVat = r2(item.unitPriceExVat + .5); if (R.chance(.5)) fuzzFix(item); },
+  returns(R, d) { R.pick(d.rows).section = 'returns'; },
+  deposit(R, d) { const item = R.pick(d.rows); item.description = 'פיקדון ' + item.description; },
+  credit(R, d) { d.docType = 'credit'; for (const key of ['subtotalExVat', 'vatAmount', 'totalInclVat']) d[key] = -Math.abs(d[key]); },
+  minus(R, d) { d.subtotalExVat = -Math.abs(d.subtotalExVat); },
+  subtotal(R, d) { d.subtotalExVat = r2(d.subtotalExVat + 1); },
+  counter(R, d) { d.itemsPrintedLines = (d.itemsPrintedLines || 0) + 1; },
+  star(R, d) { const item = R.pick(d.rows); item.promoStar = !item.promoStar; },
+  date(R, d) { d.docDate = '8.9.2026'; },
+};
+// קריאה של הנייר עם טעויות. כמו בקריאה אמיתית, מספרי השורות הם הסדר שבו היא ראתה אותן.
+function fuzzMutate(R, printed, names, count) {
+  const d = fuzzClone(printed);
+  for (let index = 0; index < count; index += 1) FUZZ_MUTATIONS[R.pick(names)](R, d);
+  d.rows.forEach((item, index) => { item.lineNumber = index + 1; });
+  return d;
+}
+function fuzzScenario(seed, cheapCount) {
+  const R = fuzzRandom(seed);
+  const printed = fuzzPrinted(R, R.pick(['plain', 'plain', 'plain', 'repeat', 'repeat', 'deposit', 'mixed', 'credit']));
+  const second = R.chance(.25) ? fuzzPrinted(R, 'plain', 1) : null;
+  const all = Object.keys(FUZZ_MUTATIONS);
+  const readOf = (names, count, secondNames = null) => [fuzzMutate(R, printed, names, count)]
+    .concat(second ? [fuzzMutate(R, second, secondNames || ['qty'], secondNames ? 1 : 0)] : []);
+  const cheapNames = R.chance(.5) ? ['qty', 'qty', 'qty', 'swap', 'comp'] : all;
+  const cheap = Array.from({ length: cheapCount }, () => R.chance(.06) ? 'fail' : readOf(cheapNames, R.int(0, 3)));
+  // Terra: לרוב טעות שהנייר אינו תופס (החלפה בין תאומים או העברת יחידות ביניהם).
+  const escalation = R.chance(.05) ? 'fail' : readOf(R.chance(.8) ? ['swap', 'comp'] : all, R.int(0, 2), second && R.chance(.6) ? ['subtotal'] : null);
+  // Terra#2 (או קריאת ההצלה): תלויה ב-Terra, בנייר, או בטעויות משלה.
+  const mode = R.pick(['same', 'same', 'paper', 'own', 'own', 'fail']);
+  let fourth;
+  if (mode === 'fail') fourth = 'fail';
+  else if (mode === 'same' && escalation !== 'fail') {
+    fourth = [fuzzMutate(R, escalation[0], ['drop', 'dropDup', 'dropAdd', 'codeShift', 'codeMis', 'dup', 'split', 'deposit', 'returns', 'credit'], R.chance(.5) ? 1 : 0)]
+      .concat(second ? [R.chance(.5) ? fuzzClone(second) : fuzzClone(escalation[1])] : []);
+  } else fourth = readOf(mode === 'paper' ? ['qty'] : all, mode === 'paper' ? 0 : R.int(1, 2), second ? (R.chance(.5) ? ['qty'] : null) : null);
+  return { printed, second: Boolean(second), reads: { cheap, escalation, fourth }, body: R.chance(.6) ? APP_142 : {} };
+}
+const FUZZ_FIELDS = ['quantity', 'unitPriceExVat', 'lineTotalExVat'];
+const fuzzValue = (field, value) => value == null || !Number.isFinite(Number(value)) ? null : Math.round(Number(value) * (field === 'quantity' ? 1000 : 100));
+const fuzzDeposit = item => /פ.?קדון/.test(String((item && item.description) || ''));
+// כל ההפרות בתרחיש אחד (מערך ריק — אין).
+async function fuzzProblems(seed, cheapCount, stats) {
+  const sc = fuzzScenario(seed, cheapCount);
+  const documents = sc.second ? [input[0], { ...input[0], noteIndex: 1 }] : input;
+  const env = { OPENAI_CONSENSUS_READS: String(cheapCount) };
+  const dark = await stagedRequest(sc.reads, documents, { ...env, ...SECOND_OFF }, sc.body);
+  const lit = await stagedRequest(sc.reads, documents, env, sc.body);
+  const D = dark.output, L = lit.output, problems = [];
+  const note = text => problems.push(seed + ': ' + text);
+  if (!D.ok || !L.ok) { if (D.ok !== L.ok || D.error !== L.error) note('ok/error differ'); return problems; }
+  const record = L.consensus.secondStrongRead;
+  stats.runs += 1;
+  // שירות 18 ועוד לכל היותר קריאה אחת, במשבצת של קריאת ההצלה.
+  if (lit.calls.length > cheapCount + 2) note('more than ' + (cheapCount + 2) + ' calls');
+  const before = run => run.calls.filter((call, index) => ['cheap', 'escalation'].includes(run.stages[index]));
+  if (!isDeep(before(lit), before(dark))) note('the cheap reads or the escalation differ');
+  if (dark.stages.includes('checksum_retry')) {
+    const darkNote = dark.calls.at(-1).input[1].content.at(-1).text, litNote = lit.calls.at(-1).input[1].content.at(-1).text;
+    if (lit.calls.length !== dark.calls.length || lit.stages.at(-1) !== 'checksum_retry' || !litNote.startsWith(darkNote)) note('shared slot differs');
+  } else if (lit.calls.length !== dark.calls.length) {
+    stats.bought += 1;
+    if (lit.calls.length !== dark.calls.length + 1 || lit.stages.at(-1) !== 'second_strong_read') note('extra call: ' + lit.stages.join(','));
+    // C3: כל מספר בהנחיה הוא מסמך, עמוד או שורה.
+    const allowed = new Set(record.closed.concat(record.open).flatMap(place => [String(place.noteIndex), String(place.page), String(place.lineNumber)]));
+    const leaked = (lit.calls.at(-1).input[1].content.at(-1).text.match(/\d+(\.\d+)?/g) || []).filter(value => !allowed.has(value));
+    if (leaked.length) note('C3 value in note ' + leaked);
+    if (!record.closed.concat(record.open).length) note('bought with nothing asked');
+  }
+  const darkC = comparable(D), litC = comparable(L);
+  // הערכים של הקריאה שנבחרה אינם משתנים; אזהרת "אישור ידני" של שורה שנסגרה כולה יכולה רק לרדת.
+  if (!isDeep(litC.scan.documents, darkC.scan.documents)) note('scan documents differ');
+  for (const key of ['missingRows', 'docDateUnconfirmed', 'escalationSelected', 'agreed', 'escalated', 'unverifiedSingleRead', 'diffs']) {
+    if (!isDeep(litC.consensus[key], darkC.consensus[key])) note('consensus.' + key + ' differs');
+  }
+  if (!isDeep(litC.paperValidation, darkC.paperValidation)) note('paperValidation differs');
+  if (L.model !== D.model || L.requestId !== D.requestId) note('selected read differs');
+  // disputedRows דלוק = כבוי פחות השדות שנסגרו, וכל שדה שנסגר היה מחלוקת של שירות 18 שאף עד אינו מאשר.
+  const closedKeys = new Set(record.closed.map(item => item.noteIndex + ':' + item.rowIndex + ':' + item.field));
+  const expected = D.consensus.disputedRows.map(entry => ({ ...entry, fields: entry.fields.filter(field => !closedKeys.has(entry.noteIndex + ':' + entry.rowIndex + ':' + field.field)) }))
+    .filter(entry => entry.fields.length);
+  if (!isDeep(L.consensus.disputedRows, expected)) note('disputedRows is not service 18 minus the closed fields');
+  for (const item of record.closed) {
+    const entry = D.consensus.disputedRows.find(each => each.noteIndex === item.noteIndex && each.rowIndex === item.rowIndex);
+    const field = entry && entry.fields.find(each => each.field === item.field);
+    if (!field || field.confirmed !== 0) note('closed a field service 18 did not leave open');
+  }
+  if (L.scan.warnings.some(warning => !D.scan.warnings.includes(warning))) note('added a warning');
+  // מול האמת: לכל שדה שנשאל או נסגר.
+  const selectedStage = L.scanAudit.attempts.find(attempt => attempt.selected).stage;
+  const cheapReads = sc.reads.cheap.filter(read => read !== 'fail');
+  const docOf = (read, noteIndex) => read && read !== 'fail' ? read.find(each => each.noteIndex === noteIndex) : null;
+  const byTag = (d, tag) => (d ? d.rows : []).filter(each => fuzzTag(each) === tag);
+  const voter = ['second_strong_read', 'checksum_retry'].includes(record.stage) ? sc.reads.fourth : null;
+  const places = record.closed.map(item => ({ ...item, closed: true })).concat(record.open.map(item => ({ ...item, closed: false })));
+  stats.asked += places.length; stats.closed += record.closed.length;
+  for (const place of places) {
+    const selectedDoc = L.scan.documents.find(each => each.noteIndex === place.noteIndex), item = selectedDoc.rows[place.rowIndex];
+    const tag = fuzzTag(item), truth = sc.printed.rows.find(each => fuzzTag(each) === tag);
+    const cheapAt = cheapReads.map(read => byTag(docOf(read, place.noteIndex), tag));
+    const value = fuzzValue(place.field, item[place.field]);
+    const why = [];
+    if (place.noteIndex !== 0) why.push('second document');
+    if (selectedStage !== 'consensus_escalation') why.push('selected ' + selectedStage);
+    if (!tnuvaPaperCheck(selectedDoc, 1).receivable || tnuvaRowArithmetic(item) !== true) why.push('C1');
+    if (!FUZZ_FIELDS.includes(place.field) || item.section !== 'items' || fuzzDeposit(item)) why.push('C2 selected');
+    if (cheapReads.some(read => tnuvaPaperCheck(docOf(read, place.noteIndex), 1).review.length)) why.push('C2 cheap document');
+    if (cheapAt.some(rows => rows.some(each => each.section !== 'items' || fuzzDeposit(each)))) why.push('C2 cheap row');
+    // הקריאות הזולות של השורה המודפסת הזאת (בדיוק שורה אחת בכל קריאה): לפחות שתיים, שונות זו מזו ומ-Terra.
+    const cheapValues = cheapAt.filter(rows => rows.length === 1).map(rows => fuzzValue(place.field, rows[0][place.field])).filter(each => each !== null);
+    if (cheapValues.length < 2) why.push('fewer than two cheap readings of the printed row');
+    else if (new Set(cheapValues).size < cheapValues.length) why.push('cheap readings agree');
+    if (cheapValues.includes(value)) why.push('a cheap reading confirms Terra');
+    if (!(item.code && cheapAt.some(rows => rows.some(each => each.code === item.code)))) why.push('identity open');
+    if (!item.code || selectedDoc.rows.filter(each => each.code === item.code).length !== 1) why.push('vote impossible');
+    if (place.closed) {
+      const votes = voter && voter !== 'fail' ? byTag(docOf(voter, place.noteIndex), tag) : [];
+      if (votes.length !== 1 || fuzzValue(place.field, votes[0][place.field]) !== value) why.push('the voter did not read this printed row so');
+      const voterDoc = docOf(voter, place.noteIndex);
+      if (!voterDoc || tnuvaPaperCheck(voterDoc, 1).review.length || votes.some(each => each.section !== 'items' || fuzzDeposit(each))) why.push('C2 voter');
+      if (truth && fuzzValue(place.field, truth[place.field]) !== value) stats.wrong += 1;
+      const last = place.reads.at(-1);
+      if (!(last.stage === record.stage && fuzzValue(place.field, last.value) === value)) why.push('C4 record');
+    }
+    if (why.length) note((place.closed ? 'closed' : 'asked') + ' line ' + place.lineNumber + ' ' + place.field + ': ' + why.join(', '));
+  }
+  return problems;
+}
+const isDeep = (a, b) => { try { assert.deepEqual(a, b); return true; } catch { return false; } };
+for (const [cheapCount, seeds] of [[2, 1200], [3, 600]]) {
+  test(`v19 review fuzz (${cheapCount} cheap reads): on vs off on the same model answers, and every asked or closed field against the printed truth`, async () => {
+    const stats = { runs: 0, bought: 0, asked: 0, closed: 0, wrong: 0 };
+    const problems = [];
+    for (let seed = 1; seed <= seeds; seed += 1) problems.push(...await fuzzProblems(seed + cheapCount * 100000, cheapCount, stats));
+    assert.deepEqual(problems.slice(0, 20), [], JSON.stringify(stats) + ' ' + problems.length + ' problems');
+    // הפאזר אכן מגיע לשלב 3: שואל וסוגר.
+    assert.ok(stats.asked > 20 && stats.closed > 10, JSON.stringify(stats));
+  });
+}
 
 // v12: נתק בדרך אל המודל אינו תשובה — הקריאה שנפלה מהר מנסה שוב פעם אחת.
 test('a read dropped on the way to the model is retried once, and the scan never sees it', async () => {
