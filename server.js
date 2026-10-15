@@ -62,7 +62,7 @@ const OPENAI_TIMEOUT_MS = 180_000;
 export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
-const SERVICE_VERSION = 16; // Promo matching rejects different flavors, including same-price substitutes.
+const SERVICE_VERSION = 17; // No document number; an unreadable header is a regular document and does not escalate.
 // v13: עבודת סריקה נשמרת חצי שעה אחרי שהסתיימה, ושעה לכל היותר מרגע שנפתחה.
 // זה מכסה בנוחות טלפון שנפל וחוזר, ואינו מחזיק זיכרון מעבר לכך.
 const SCAN_JOB_TTL_MS = 30 * 60 * 1000;
@@ -111,7 +111,7 @@ const documentSchema = {
   type: "object",
   additionalProperties: false,
   required: [
-    "noteIndex", "docNumber", "docType", "docDate", "pageCount", "vatPct",
+    "noteIndex", "docType", "docDate", "pageCount", "vatPct",
     "itemsSectionTotalExVat", "promoDiscountExVat", "itemsPrintedLines",
     "returnsSectionTotalExVat", "returnsPrintedLines",
     "subtotalExVat", "vatAmount", "totalInclVat", "roundingDiff",
@@ -119,8 +119,8 @@ const documentSchema = {
   ],
   properties: {
     noteIndex: { type: "integer" },
-    docNumber: nullable("string"),
-    docType: { type: "string", enum: ["invoice", "credit", "unknown"] },
+    // שירות 17: אין מספר תעודה, וסוג התעודה הוא זיכוי או רגילה בלבד.
+    docType: { type: "string", enum: ["invoice", "credit"] },
     docDate: nullable("string"),
     pageCount: { type: "integer" },
     vatPct: nullable("number"),
@@ -317,8 +317,8 @@ const SYSTEM_PROMPT = `אתה מפענח תעודות משלוח וחשבוני�
 10. שדות הסיכום מוחזרים בדיוק כפי שהם מודפסים: itemsSectionTotalExVat הוא סה"כ מקטע הפריטים אם מודפס בנפרד; promoDiscountExVat הוא סכום שורת "סד הנחה בגין מבצעים"; returnsSectionTotalExVat הוא סה"כ מקטע ההחזרות; subtotalExVat הוא "סהכ חייב מעמ" — הסכום הסופי לפני מע"מ; vatAmount הוא סכום המע"מ; totalInclVat הוא הסכום כולל מע"מ; roundingDiff הוא "הפרש עיגול" עם הסימן המודפס. שדה שאינו מודפס או אינו קריא — null.
 11. vatPct הוא אחוז המע"מ כפי שמודפס על המסמך (למשל 18). לעולם אל תניח אחוז ואל תשתמש בידע כללי — אם אינו מודפס או אינו קריא, החזר null והוסף אזהרה.
 12. itemsPrintedLines ו-returnsPrintedLines הם מוני "פריטים" המודפסים בסיכום של כל מקטע. אל תחשב אותם בעצמך אם אינם מודפסים. על הנייר של תנובה אין מונה יחידות כולל — אין שדה כזה בפלט.
-13. docType הוא "credit" אם המסמך הוא חשבונית זיכוי (חש. זיכוי או ניסוח דומה בכותרת), "invoice" לחשבונית או תעודת משלוח רגילה, ו-"unknown" רק אם הכותרת אינה קריאה. בחשבונית זיכוי החזר את סכומי הסיכום עם המינוס כפי שמודפס, ואת השורות ללא סימן כפי שמודפסות.
-14. docNumber הוא מספר התעודה המודפס. docDate הוא תאריך המסמך המודפס, בדיוק כפי שמופיע. description מכיל רק את תיאור המוצר כפי שהוא מודפס, גם אם הוא מקוצר — אל תרחיב אותו לשם מלא ואל תתקן אותו לפי מוצר מוכר.
+13. docType הוא "credit" רק אם רואים במפורש שהמסמך הוא חשבונית זיכוי (חש. זיכוי או ניסוח דומה), ו-"invoice" בכל מקרה אחר — גם כשהכותרת חתוכה או אינה קריאה. מספר התעודה אינו נדרש: אל תחפש אותו ואל תוסיף אזהרה על כותרת או מספר תעודה שחתוכים או אינם קריאים. החזר כל סכום בסיכום עם הסימן המודפס, כולל מינוס לפני המספר או אחריו, גם כשהכותרת אינה נראית; את השורות החזר ללא סימן כפי שמודפסות.
+14. docDate הוא תאריך המסמך המודפס, בדיוק כפי שמופיע. description מכיל רק את תיאור המוצר כפי שהוא מודפס, גם אם הוא מקוצר — אל תרחיב אותו לשם מלא ואל תתקן אותו לפי מוצר מוכר.
 15. אם חלק מהעמוד מטושטש, חלץ את השורות הקריאות והוסף אזהרה מפורשת לגבי החלק שלא נקרא. אל תמציא שורות ואל תדווח על אפס שורות כאשר נראית טבלת מוצרים שאינך מצליח לקרוא בביטחון.
 16. pageCount הוא מספר התמונות שסומנו עבור אותו noteIndex, לא מספר העמוד שמודפס על הנייר. sourcePage מתחיל ב-1 ומתייחס למיקום התמונה בתוך המסמך.
 17. confidence הוא ביטחון בקריאה מהצילום, לא ביטחון בכך שהחשבון מסתדר. ביטחון של שורה צריך לשקף את השדה הקריטי החלש ביותר בה.
@@ -333,7 +333,7 @@ export function validModelScan(scan, inputDocuments) {
     if (!doc || !Number.isInteger(doc.noteIndex) || seen.has(doc.noteIndex)) return false;
     const input = inputDocuments.find(candidate => candidate.noteIndex === doc.noteIndex);
     if (!input || !Number.isInteger(doc.pageCount) || doc.pageCount !== input.pages.length) return false;
-    if (!stringOrNull(doc.docNumber) || !stringOrNull(doc.docDate)) return false;
+    if (!stringOrNull(doc.docDate)) return false;
     if (doc.docType !== "invoice" && doc.docType !== "credit" && doc.docType !== "unknown") return false;
     if (typeof doc.confidence !== "number" || !Number.isFinite(doc.confidence) || doc.confidence < 0 || doc.confidence > 1) return false;
     if (!Array.isArray(doc.rows) || !Array.isArray(doc.warnings) || doc.warnings.some(warning => typeof warning !== "string")) return false;
@@ -407,17 +407,22 @@ export function tnuvaPaperCheck(input, pageCount) {
   const promo = Math.abs(cents(doc && doc.promoDiscountExVat) || 0);
   const net = itemsCents - promo - returnsCents;
   const credit = doc && doc.docType === 'credit';
-  const expected = credit && subtotal != null ? Math.abs(subtotal) : subtotal;
+  // v141: מינוס על סכום מסכם הוא סימן לזיכוי גם כשהכותרת ("זיכוי") לא צולמה.
+  // החשבון נבדק אז בערך מוחלט, כדי שקריאה חוזרת לא "תתקן" אותו בהשמטת המינוס.
+  const minusSummary = !credit && [subtotal, itemSummary, cents(doc && doc.vatAmount), cents(doc && doc.totalInclVat)].some(v => v != null && v < 0);
+  const expected = (credit || minusSummary) && subtotal != null ? Math.abs(subtotal) : subtotal;
   // The numbers themselves, not only the fact that they differ. The bare
   // sentence left the user with nothing to compare against the paper.
   const shekels = value => '₪' + (value / 100).toFixed(2);
-  if (expected != null && net !== expected) problems.push('החשבון לא נסגר: שורות הפריטים ' + shekels(itemsCents) +
+  // מינוס שהוא מהחזרות גדולות מהסחורה נסגר בסימן שלו; מינוס של זיכוי — בערך מוחלט.
+  if (expected != null && net !== expected && !(minusSummary && net === subtotal)) problems.push('החשבון לא נסגר: שורות הפריטים ' + shekels(itemsCents) +
     (promo ? ' פחות הנחה ' + shekels(promo) : '') + (returnsCents ? ' פחות החזרות ' + shekels(returnsCents) : '') +
     ' = ' + shekels(net) + ', אבל "סהכ חייב מעמ" נקרא ' + shekels(expected) + ' (הפרש ' + shekels(Math.abs(net - expected)) + ')');
+  // שירות 17 (כמו אפליקציה 141): ראש התעודה אינו תנאי לקליטה. רק זיכוי שזוהה
+  // במפורש נעצר; כותרת שלא נקראה נחשבת תעודה רגילה.
   if (credit) review.push('זו חשבונית זיכוי — יש להזין אותה במסך החזרות, ולא כקליטת סחורה');
-  else if (!doc || doc.docType !== 'invoice') review.push('סוג התעודה לא זוהה בוודאות — יש לבדוק את הכותרת');
   if (returnLines || (returnSummary != null && returnSummary !== 0)) review.push('התעודה כוללת החזרות. יש להפריד אותן לפי תהליך ההחזרות הקיים ולהזין ידנית את נתוני הקליטה');
-  if (!credit && subtotal != null && subtotal <= 0) review.push('סכום התעודה אינו חיובי — יש לבדוק את סוג התעודה');
+  if (!credit && (minusSummary || (subtotal != null && subtotal <= 0))) review.push('סכום התעודה אינו חיובי — כנראה חשבונית זיכוי; יש להזין אותה במסך החזרות, ולא כקליטת סחורה');
   return { ok: problems.length === 0, receivable: !problems.length && !review.length,
     problems, review, missingSummary, retryable: problems.length > 0 && !missingSummary,
     amount: subtotal == null ? null : subtotal / 100, lines: printedLines == null ? null : printedLines,
@@ -509,7 +514,10 @@ function checksumTotalError(mismatches) {
 // מאושרת בלי הסלמה; הבדל כלשהו = המודל היקר מכריע, והשורות שנחלקו עולות
 // לאישור ידני של המשתמש.
 const CONSENSUS_ROW_FIELDS = ["section", "code", "quantity", "unitPriceExVat", "lineTotalExVat", "promoStar", "sourcePage"];
-const CONSENSUS_DOC_FIELDS = ["docNumber", "docDate", "docType", "pageCount", "vatPct", "itemsSectionTotalExVat",
+// שירות 17: מספר התעודה אינו נקרא כלל, וסוג התעודה נבדל רק בין זיכוי לכל השאר.
+// ב-15.10 קריאה אחת ראתה "invoice" והשנייה "unknown" כי הכותרת נחתכה בצילום —
+// הבדל שאינו משנה שום שקל, ובכל זאת שילם על הסלמה למודל היקר.
+const CONSENSUS_DOC_FIELDS = ["docDate", "docType", "pageCount", "vatPct", "itemsSectionTotalExVat",
   "promoDiscountExVat", "itemsPrintedLines", "returnsSectionTotalExVat", "returnsPrintedLines", "subtotalExVat",
   "vatAmount", "totalInclVat", "roundingDiff"];
 const CONSENSUS_MONEY_FIELDS = new Set(["unitPriceExVat", "lineTotalExVat", "itemsSectionTotalExVat", "promoDiscountExVat",
@@ -519,6 +527,7 @@ const MAX_CONSENSUS_CORRECTIVE_LINES = 40;
 // התיאור ורמת הביטחון משתנים בין קריאה לקריאה גם כשהנייר נקרא נכון, ולכן הם
 // אינם חלק מתנאי הזהות. מה שנשווה הוא זהות המוצר והכסף בלבד.
 function consensusValue(field, value) {
+  if (field === "docType") return value === "credit" ? "credit" : "invoice";
   if (value === undefined || value === null) return null;
   if (field === "promoStar") return value === true;
   if (field === "quantity") return Number.isFinite(Number(value)) ? Math.round(Number(value) * 1000) : null;

@@ -41,7 +41,33 @@ test('mixed and credit documents are checked but never adopted as ordinary recei
   assert.equal(check.ok, true); assert.equal(check.receivable, false); assert.equal(check.lines, 1);
   assert.equal(tnuvaPaperCheck(doc({ docType: 'credit', subtotalExVat: -50 }), 1).ok, true);
   assert.equal(tnuvaPaperCheck(doc({ docType: 'credit', subtotalExVat: -50 }), 1).receivable, false);
-  assert.equal(tnuvaPaperCheck(doc({ docType: 'unknown' }), 1).receivable, false);
+});
+test('service 17: an unreadable header is a regular document, and the reads never dispute the header', () => {
+  // 15.10: the header was cut off in the photo; every row was read and the paper closed to the agora.
+  const unknown = tnuvaPaperCheck(doc({ docType: 'unknown' }), 1);
+  assert.equal(unknown.ok, true); assert.equal(unknown.receivable, true); assert.deepEqual(unknown.review, []);
+  assert.equal(tnuvaPaperCheck(doc({ docType: undefined }), 1).receivable, true);
+  const fields = diffs => diffs.filter(d => d.scope === 'document').map(d => d.field);
+  assert.deepEqual(fields(scanConsensusDiff(scan(doc({ docType: 'invoice' })), scan(doc({ docType: 'unknown' })))), []);
+  assert.deepEqual(fields(scanConsensusDiff(scan(doc({ docNumber: '561011080' })), scan(doc({ docNumber: null })))), []);
+  assert.deepEqual(fields(scanConsensusDiff(scan(doc()), scan(doc({ docType: 'credit', subtotalExVat: -50 })))), ['docType', 'subtotalExVat']);
+});
+test('service 17: a credit note whose title was cut is stopped by its minus signs, without a paid retry', () => {
+  // The paper sums close in absolute value, so there is nothing for a corrective read to "fix" by dropping the minus.
+  const cut = tnuvaPaperCheck(doc({ docType: 'invoice', subtotalExVat: -50, vatAmount: -9, totalInclVat: -59 }), 1);
+  assert.equal(cut.ok, true); assert.equal(cut.receivable, false); assert.equal(cut.retryable, false);
+  assert.match(cut.review.join(' '), /כנראה חשבונית זיכוי/);
+  assert.deepEqual(scanChecksumMismatches(scan(doc({ subtotalExVat: -50, vatAmount: -9, totalInclVat: -59 })), input), []);
+  // Only part of the minus survived the read: still not ordinary goods.
+  const partial = tnuvaPaperCheck(doc({ itemsSectionTotalExVat: -50, vatAmount: -9, totalInclVat: -59 }), 1);
+  assert.equal(partial.ok, true); assert.equal(partial.receivable, false);
+  assert.equal(tnuvaPaperCheck(doc({ roundingDiff: -0.03 }), 1).receivable, true, 'a negative rounding line is normal');
+  // A mixed paper whose returns exceed its goods closes with its own sign: no paid retry.
+  const mixed = doc({ itemsSectionTotalExVat: 50, returnsSectionTotalExVat: 80, returnsPrintedLines: 1, subtotalExVat: -30, vatAmount: -5.4, totalInclVat: -35.4,
+    rows: [row(), row({ section: 'returns', quantity: 16, lineTotalExVat: 80 })] });
+  const mixedCheck = tnuvaPaperCheck(mixed, 1);
+  assert.equal(mixedCheck.ok, true); assert.equal(mixedCheck.receivable, false); assert.equal(mixedCheck.retryable, false);
+  assert.deepEqual(scanChecksumMismatches(scan(mixed), input), []);
 });
 test('crates remain normal products; deposit money counts without becoming product units', () => {
   const d=doc({ subtotalExVat: 63.05, itemsPrintedLines: 3, rows: [row(),
@@ -126,7 +152,7 @@ test('promo sheets without barcodes match only catalog aliases and preserve the 
   const { output, calls } = await requestPromo([promoRow()]);
   assert.equal(output.ok, true);
   assert.equal(output.promoCatalogMatching, true);
-  assert.equal(output.serviceVersion, 16);
+  assert.equal(output.serviceVersion, 17);
   assert.equal(output.sheet.rows[0].barcode, null);
   assert.equal(output.sheet.rows[0].productId, 'catalog-cheese');
   assert.deepEqual(output.sheet.rows[0].candidateProductIds, ['catalog-cheese']);
@@ -602,7 +628,7 @@ test('a key the instance never saw says so, so the client knows to send the phot
   const output = await sendScan(server, { scanKey: 'no-such-key-01', resume: true }).ended;
   assert.equal(output.ok, false);
   assert.equal(output.error, 'resume_unknown');
-  assert.equal(output.serviceVersion, 16);
+  assert.equal(output.serviceVersion, 17);
   assert.equal(calls.length, 0);
   server.close();
 });
