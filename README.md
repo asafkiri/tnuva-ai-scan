@@ -13,24 +13,44 @@ star and section, whether a row exists, the row count, and the document type,
 page count, section totals, promotion discount, printed line counters and net
 subtotal. The document type is compared as service 17 compares it — a credit
 note against anything else — so `invoice` against `unknown` is no difference,
-and the document number is not compared because it is not read. The document
-date (the owner's decision), the page a row was assigned to, the VAT rate, the
-VAT amount, the total including VAT and the rounding difference do not
-escalate: the app shows them as information or a warning and computes with its
-own VAT setting and the printed net. A difference in them is still returned in
-`consensus.diffs`, marked `trigger: false`, and `consensus.agreed` is computed
-on the other differences only — reads that differ only in the date cost one
-paid call less. Together with service 17 this covers the photo whose header
-was cut: under service 17 the type no longer escalated, but the date that was
-usually cut with it still did; now neither does, and the date is named in
-`consensus.docDateUnconfirmed` instead. A minus sign that only one read saw on
-a summary amount is a money difference and still escalates.
+and the document number is not compared because it is not read. The page a
+row was assigned to, the VAT rate, the VAT amount, the total including VAT and
+the rounding difference do not escalate: the app shows them as information or a
+warning and computes with its own VAT setting and the printed net. A difference
+in them is still returned in `consensus.diffs`, marked `trigger: false`, and
+`consensus.agreed` is computed on the other differences only.
 
-Because a date difference no longer buys the retry model, a cheap read can be
-selected with a date nobody settled. The owner's decision is that a date that
-was not read well defaults to today. The app uses the printed date only as the
-day prices and promotion validity are checked against, so it needs to know when
-not to trust that date. `consensus.docDateUnconfirmed` lists the `noteIndex` of
+Two differences in those fields still escalate. The first is a sign
+difference on the VAT amount or the total including VAT. Under service 17 a
+minus on either one marks a credit note whose title was cut, so one read seeing
+the minus and the other not is the difference between receiving goods and
+stopping a credit note. If it did not escalate and the read without the minus
+were the first one, the credit note would be received as goods. A value that
+was not read (`null`) is not a minus. A difference in value with the same sign
+(9 against 9.01, or −9 against −9.01) is still information only. A minus that
+only one read saw on the net subtotal or the items section total was always a
+money difference and escalates too.
+
+The second is the document date, which (the owner's decision) costs nothing
+only for a scan whose request carried `"strongReadSelection": true`, that is,
+from app 142. App 142 knows not to trust a date nobody settled and checks
+promotions against today instead. Apps up to 141 check promotion validity, and
+141's "promotion not applied" card, against the printed date as read. So
+without the flag a date difference escalates as it did in service 17: the
+retry model settles it and, without the flag, its read is the one returned,
+and the `docDate` entry in `consensus.diffs` carries no `trigger: false`. With
+the flag, reads that differ only in the date cost one paid call less. Together
+with service 17 this covers the photo whose header was cut: under service 17
+the type no longer escalated, but the date that was usually cut with it still
+did. For app 142 neither does now, and the date is named in
+`consensus.docDateUnconfirmed` instead. For an older app the cut type still
+costs nothing and the cut date escalates, exactly as in service 17.
+
+Because for app 142 a date difference no longer buys the retry model, a cheap
+read can be selected with a date nobody settled. The owner's decision is that a
+date that was not read well defaults to today. The app uses the printed date
+only as the day prices and promotion validity are checked against, so it needs
+to know when not to trust that date. `consensus.docDateUnconfirmed` lists the `noteIndex` of
 every document where another read read a different date and no other read
 confirms the selected date. "Another read" means the same witnesses as
 `consensus.disputedRows`: every completed cheap read and the retry model's
@@ -42,7 +62,8 @@ calendar days, parsed the way the app's `priceAuditDate` parses them: ISO
 `2026-09-17` confirm each other, and so do `7.9.2026` and `07.09.2026`. Only
 when one side does not parse as a real day are the trimmed strings compared.
 `consensus.diffs` and the escalation rules are unchanged: there a format-only
-difference is still listed, with `trigger: false`. Dates are compared directly
+difference is still listed, and escalates exactly when any other date difference
+does. Dates are compared directly
 from the documents, not taken from `consensus.diffs`, which stops at 200
 entries. A read that returned no date, or did not return that document, does
 not confirm.
@@ -87,14 +108,28 @@ the stop for a paper that disproves the typed anchor, and buy a checksum retry.
 The typed anchor is checked against the selected read afterwards, as before.
 The paper check is service 17's, so a credit note whose title was cut closes in
 absolute value and a mixed paper whose returns exceed its goods closes with its
-own sign: neither costs a read any paper error. The measure is counted in whole
+own sign. The measure uses the amount the paper check actually compared the
+rows with (`checkedAmount` in `paperValidation`): the absolute value for a
+credit note, and for a paper with a minus on a summary amount whichever of the
+signed or absolute value is nearer the rows. `amount` stays the printed amount
+with its sign. So keeping the minus never costs a read any paper error, also
+when that read's paper fails for another reason, such as one misread quantity.
+Measured against the signed amount, a credit read of −80 that kept its minus
+and misread one quantity scored 161, while a read that dropped every minus and
+misread two quantities scored 2. That read was then selected, and the credit
+stop was lost. The same measure decides the checksum retry for every client, so
+a retry that drops the minus no longer beats a first read that kept it with
+the same number of problems. That bias was in service 17 too. The sign itself
+is still not part of the measure: a read that dropped the minus and has fewer
+other problems still wins over a read that kept it. The measure is counted in whole
 agorot, with a shekel of gap, a line off the counter and each other paper
 problem weighing 100 each, so two reads the same number of agorot off are a
 true tie rather than a floating-point draw. A document whose printed summary was
 not read scores the same fixed penalty plus its problems in every read, instead
 of rewarding the read with fewer rows or a smaller sum. The checksum retry
 compares a retry against the read it replaces with the same measure for every
-client; the weights are the ones it always had. Every read not selected, the
+client. The weights are the ones it always had, and only the amount a credit
+note or a negative mixed paper is measured against changed, as above. Every read not selected, the
 retry model's included, is a witness for `consensus.disputedRows` and
 `consensus.missingRows`. `consensus.escalated` and `consensus.escalationModel`
 still say that the third read happened and on which model;
@@ -221,13 +256,18 @@ unchanged.
 `npm test` runs deterministic arithmetic and the actual HTTP handler with
 fixture Firebase signatures and mocked model responses. No paid requests.
 
-The order of release no longer matters. Service 18 selects by the paper only
-for a scan whose request carried `"strongReadSelection": true`, and only app
-142 sends it. App 141 and older word every escalated dispute as "הכריע <model>
-בקריאה שלישית"; against service 18 they keep the old selection, so a completed
-escalation is still the read they are shown, and the wording stays true. The
-rest of service 18 is safe for them: fewer escalations, a corrective note
-without values, a warning on a lone read, and fields they ignore. App 142
+The order of release no longer matters. Service 18 selects by the paper, and
+lets a date difference go without a paid read, only for a scan whose request
+carried `"strongReadSelection": true`, and only app 142 sends it. App 141 and
+older word every escalated dispute as "הכריע <model> בקריאה שלישית", and check
+promotions against the printed date as read. Against service 18 they keep the
+old selection, so a completed escalation is still the read they are shown and
+the wording stays true. They also keep the old date rule: a date difference
+escalates and the retry model's date is the one they get, as in service 17.
+The rest of service 18 is safe for them: no escalation on the page, VAT rate,
+VAT value or rounding, a sign difference on the VAT or the total that still
+escalates (as in service 17), a corrective note without values, a warning on a
+lone read, and fields they ignore. App 142
 against service 16 or 17: those services ignore the flag and return the
 escalation read. App 142 reads `consensus.escalationSelected` and
 `consensus.unverifiedSingleRead`. When service 16 or 17 omits them, it falls

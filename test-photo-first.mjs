@@ -563,7 +563,8 @@ test('v18: fields that decide nothing are still reported, marked trigger:false',
 });
 
 test('v18: a date or a page the reads disagree on costs no escalation', async () => {
-  const { output, calls } = await request([answer(doc()), answer(doc({ docDate: '1.9.2026' }))]);
+  // התאריך — לאפליקציה 142 בלבד; בלי הדגל הוא מסלים כמו בשירות 17 (ראו בדיקת התאריך מול אפליקציה ישנה).
+  const { output, calls } = await request([answer(doc()), answer(doc({ docDate: '1.9.2026' }))], input, {}, APP_142);
   assert.equal(calls.length, 2, 'one paid call fewer than service 17');
   assert.equal(output.consensus.agreed, true);
   assert.equal(output.consensus.escalated, false);
@@ -591,7 +592,8 @@ test('v18: a date or a page the reads disagree on costs no escalation', async ()
 // v18: הכרעת בעל החנות — תאריך שלא נקרא היטב, היום. השירות אינו מחליף את
 // התאריך המודפס; הוא אומר לאיזו תעודה אף קריאה אחרת אינה מאשרת את התאריך שנבחר.
 test('v18: a date no other read confirms is named, though nothing escalates and the printed date stays', async () => {
-  const { output, calls } = await request([answer(doc()), answer(doc({ docDate: '1.9.2026' }))]);
+  // אפליקציה 142 (הדגל): התאריך אינו מסלים, והאפליקציה עוברת להיום.
+  const { output, calls } = await request([answer(doc()), answer(doc({ docDate: '1.9.2026' }))], input, {}, APP_142);
   assert.equal(calls.length, 2, 'still no escalation for a date');
   assert.equal(output.consensus.agreed, true);
   assert.deepEqual(output.consensus.docDateUnconfirmed, [0]);
@@ -599,11 +601,11 @@ test('v18: a date no other read confirms is named, though nothing escalates and 
   assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected]), [['consensus_1', true], ['consensus_2', false]]);
   assert.ok(!output.scan.warnings.length, 'the app shows the assumed day; the service adds no warning');
   // אותו תאריך בשתי הקריאות — גם כשהן נבדלות ברווח בלבד — הוא תאריך מאושר.
-  const same = await request([answer(doc()), answer(doc({ docDate: ' 7.9.2026 ' }))]);
+  const same = await request([answer(doc()), answer(doc({ docDate: ' 7.9.2026 ' }))], input, {}, APP_142);
   assert.deepEqual(same.output.consensus.diffs, []);
   assert.deepEqual(same.output.consensus.docDateUnconfirmed, []);
   // קריאה שלא קראה תאריך כלל אינה מאשרת את התאריך שנבחר.
-  const unread = await request([answer(doc()), answer(doc({ docDate: null }))]);
+  const unread = await request([answer(doc()), answer(doc({ docDate: null }))], input, {}, APP_142);
   assert.equal(unread.calls.length, 2);
   assert.deepEqual(unread.output.consensus.docDateUnconfirmed, [0]);
 });
@@ -680,8 +682,8 @@ test('v18: the same day read in two formats is a confirmed date; diffs still rep
     assert.deepEqual(scanConsensusDocDateUnconfirmed(read(a), [read(b)]), [0], a + ' / ' + b);
   }
   assert.deepEqual(scanConsensusDocDateUnconfirmed(read('ספטמבר 17'), [read(' ספטמבר 17 ')]), []);
-  // מקצה לקצה: שתי הקריאות קראו את אותו יום בשתי צורות — אין הסלמה ואין מחלוקת.
-  const { output, calls } = await request([answer(doc({ docDate: '17/09/2026' })), answer(doc({ docDate: '17.09.2026' }))]);
+  // מקצה לקצה (אפליקציה 142): שתי הקריאות קראו את אותו יום בשתי צורות — אין הסלמה ואין מחלוקת.
+  const { output, calls } = await request([answer(doc({ docDate: '17/09/2026' })), answer(doc({ docDate: '17.09.2026' }))], input, {}, APP_142);
   assert.equal(calls.length, 2);
   assert.equal(output.consensus.agreed, true);
   assert.deepEqual(output.consensus.diffs.map(diff => diff.field), ['docDate']);
@@ -704,22 +706,27 @@ test('v18: money, identity and the promotion star still escalate', async () => {
 test('v18: the strong read gets the places the reads disagreed on, never the values they read', async () => {
   // הקריאה השנייה קראה בשורה 2 קוד, כמות וסכום אחרים, ולכן גם סיכום אחר — ותאריך אחר.
   const other = paper(fourRows().map((item, index) => index === 1 ? row({ ...item, code: '229', quantity: 7, lineTotalExVat: 35 }) : item));
-  const { output, calls } = await request([answer(fourRowPaper), answer(doc({ ...other, docDate: '1.9.2026' })), answer(fourRowPaper)]);
-  assert.equal(calls.length, 3);
-  assert.equal(output.consensus.agreed, false);
-  const note = calls[2].input[1].content.at(-1).text;
-  assert.ok(note.includes('מסמך noteIndex=0: subtotalExVat.'), note);
-  assert.ok(note.includes('מסמך noteIndex=0, עמוד 1, שורה 2: code, quantity, lineTotalExVat.'), note);
-  assert.ok(note.includes('באופן עצמאי'));
-  assert.ok(note.includes('עמודת הקוד נקראת בהסטה של שורה אחת'));
-  assert.ok(note.includes('שווה למונה "פריטים" המודפס'));
-  // אף ערך שנקרא: לא הקודים, לא הכמות והסכומים, לא הסיכום, לא התאריך — ולא שדות מידע.
-  for (const value of ['222', '229', '35', '96', '91', '₪', 'נקרא פעם', 'docDate', '1.9.2026', '7.9.2026', 'vatAmount', 'totalInclVat']) {
-    assert.ok(!note.includes(value), value);
+  for (const extraBody of [APP_142, {}]) {
+    const label = JSON.stringify(extraBody);
+    const { output, calls } = await request([answer(fourRowPaper), answer(doc({ ...other, docDate: '1.9.2026' })), answer(fourRowPaper)], input, {}, extraBody);
+    assert.equal(calls.length, 3, label);
+    assert.equal(output.consensus.agreed, false, label);
+    const note = calls[2].input[1].content.at(-1).text;
+    // בלי הדגל התאריך מסלים כמו בשירות 17, ולכן שמו — רק שמו — נמסר לקריאת ההכרעה.
+    assert.ok(note.includes(extraBody.strongReadSelection ? 'מסמך noteIndex=0: subtotalExVat.' : 'מסמך noteIndex=0: docDate, subtotalExVat.'), note);
+    assert.ok(note.includes('מסמך noteIndex=0, עמוד 1, שורה 2: code, quantity, lineTotalExVat.'), note);
+    assert.ok(note.includes('באופן עצמאי'));
+    assert.ok(note.includes('עמודת הקוד נקראת בהסטה של שורה אחת'));
+    assert.ok(note.includes('שווה למונה "פריטים" המודפס'));
+    // אף ערך שנקרא: לא הקודים, לא הכמות והסכומים, לא הסיכום, לא התאריך — ולא שדות מידע.
+    for (const value of ['222', '229', '35', '96', '91', '₪', 'נקרא פעם', '1.9.2026', '7.9.2026', 'vatAmount', 'totalInclVat']) {
+      assert.ok(!note.includes(value), label + ' ' + value);
+    }
+    if (extraBody.strongReadSelection) assert.ok(!note.includes('docDate'), note);
+    // קריאת ההכרעה עצמה רואה את אותם צילומים ואת אותן הנחיות כמו הקריאות הזולות.
+    assert.deepEqual(calls[2].input[0], calls[0].input[0]);
+    assert.deepEqual(calls[2].input[1].content.slice(0, -1), calls[0].input[1].content);
   }
-  // קריאת ההכרעה עצמה רואה את אותם צילומים ואת אותן הנחיות כמו הקריאות הזולות.
-  assert.deepEqual(calls[2].input[0], calls[0].input[0]);
-  assert.deepEqual(calls[2].input[1].content.slice(0, -1), calls[0].input[1].content);
 });
 
 test('v18: a cheap read that closes the paper better is selected, and the strong read becomes its witness', async () => {
@@ -885,10 +892,16 @@ test('v18: without the flag escalationSelected stays truthful when a checksum re
 test('v18: agreeing reads, a failed escalation and a lone read do not depend on the flag', async () => {
   for (const extraBody of [{}, APP_142]) {
     const label = JSON.stringify(extraBody);
-    const agreedRun = await request([answer(doc()), answer(doc({ docDate: '1.9.2026' }))], input, {}, extraBody);
-    assert.equal(agreedRun.calls.length, 2, label + ': a date alone never escalates');
-    assert.deepEqual(agreedRun.output.consensus.docDateUnconfirmed, [0], label);
+    const agreedRun = await request([answer(doc()), answer(doc({ vatAmount: 9.01, totalInclVat: 59.01 }))], input, {}, extraBody);
+    assert.equal(agreedRun.calls.length, 2, label + ': an information-only difference never escalates');
+    assert.equal(agreedRun.output.consensus.agreed, true, label);
     assert.equal(agreedRun.output.consensus.escalationSelected, false, label);
+    // התאריך שאף קריאה אינה מאשרת נמסר בשני המקרים. בלי הדגל הוא מסלים קודם, כמו
+    // בשירות 17, וכאן קריאת ההכרעה קראה תאריך שלישי.
+    const dateRun = await request([answer(doc()), answer(doc({ docDate: '1.9.2026' })), answer(doc({ docDate: '9.9.2026' }))], input, {}, extraBody);
+    assert.equal(dateRun.calls.length, extraBody.strongReadSelection ? 2 : 3, label);
+    assert.deepEqual(dateRun.output.consensus.docDateUnconfirmed, [0], label);
+    assert.equal(dateRun.output.consensus.escalationSelected, !extraBody.strongReadSelection, label);
     const failed = await request([answer(shiftedCodes), answer(shiftedCodesOther), new Error('test network failure')], input, {}, extraBody);
     assert.equal(failed.output.consensus.escalationSelected, false, label);
     assert.equal(failed.output.scan.documents[0].rows[1].code, '222', label);
@@ -909,14 +922,16 @@ test('v18 after the merge: no document number, a cut header and a credit sign be
   const { docNumber: unusedNumber, ...noNumber } = doc();
   for (const extraBody of [{}, APP_142]) {
     const label = JSON.stringify(extraBody);
-    // כותרת שנחתכה בקריאה אחת: אין הסלמה, אין מחלוקת על הכותרת, והתעודה נקלטת.
-    // התאריך שנחתך יחד איתה הוא מידע בלבד (שירות 18), והלקוח יודע שאינו מאושר.
-    const cut = await request([answer(doc({ docNumber: '561011080' })), answer({ ...noNumber, docType: 'unknown', docDate: null })], input, {}, extraBody);
-    assert.equal(cut.calls.length, 2, label + ': a cut header costs no paid read');
+    // כותרת שנחתכה בקריאה אחת: אין מחלוקת על הכותרת, והתעודה נקלטת. התאריך שנחתך
+    // יחד איתה — באפליקציה 142 מידע בלבד, והלקוח יודע שאינו מאושר; באפליקציה ישנה
+    // הוא מסלים כמו בשירות 17, וקריאת ההכרעה (שקראה את הכותרת) מכריעה אותו.
+    const fresh = extraBody.strongReadSelection === true;
+    const cut = await request([answer(doc({ docNumber: '561011080' })), answer({ ...noNumber, docType: 'unknown', docDate: null }), answer(doc())], input, {}, extraBody);
+    assert.equal(cut.calls.length, fresh ? 2 : 3, label + ': a cut header costs no paid read; only the date can');
     assert.equal(cut.output.ok, true, label);
-    assert.equal(cut.output.consensus.agreed, true, label);
-    assert.deepEqual(cut.output.consensus.diffs.map(diff => [diff.field, diff.trigger]), [['docDate', false]], label);
-    assert.deepEqual(cut.output.consensus.docDateUnconfirmed, [0], label);
+    assert.equal(cut.output.consensus.agreed, fresh, label);
+    assert.deepEqual(cut.output.consensus.diffs.map(diff => [diff.field, diff.trigger]), [['docDate', fresh ? false : undefined]], label);
+    assert.deepEqual(cut.output.consensus.docDateUnconfirmed, fresh ? [0] : [], label);
     assert.equal(cut.output.paperValidation[0].receivable, true, label);
     assert.deepEqual(cut.output.paperValidation[0].review, [], label);
     assert.equal(cut.output.scanAudit.result, 'paper_verified', label);
@@ -943,8 +958,9 @@ test('v18 after the merge: no document number, a cut header and a credit sign be
     const creditRun = await request([answer(titled), answer({ ...noNumber, docType: 'unknown' }), answer(titled)], input, {}, extraBody);
     assert.equal(creditRun.calls.length, 3, label);
     const note = creditRun.calls[2].input[1].content.at(-1).text;
-    assert.ok(note.includes('מסמך noteIndex=0: docType, subtotalExVat.'), note);
-    assert.ok(!/credit|invoice|unknown|-50|₪/.test(note), note);
+    // המע"מ והסכום כולל מע"מ נקראו כאן בסימנים שונים — הבדל בסימן מסלים, ולכן גם שמם נמסר.
+    assert.ok(note.includes('מסמך noteIndex=0: docType, subtotalExVat, vatAmount, totalInclVat.'), note);
+    assert.ok(!/credit|invoice|unknown|-50|-59|₪/.test(note), note);
     assert.equal(creditRun.output.consensus.escalationSelected, true, label + ': both close; the tie goes to the strong read');
     assert.match(creditRun.output.paperValidation[0].review.join(' '), /זו חשבונית זיכוי/, label);
     // נייר מעורב שההחזרות בו גדולות מהסחורה נסגר בסימן שלו.
@@ -955,6 +971,129 @@ test('v18 after the merge: no document number, a cut header and a credit sign be
     assert.equal(mixedRun.output.checksumRetryAttempted, false, label);
     assert.equal(mixedRun.output.paperValidation[0].ok, true, label);
     assert.equal(mixedRun.output.paperValidation[0].receivable, false, label);
+  }
+});
+
+// ===== מיזוג: סימן הזיכוי על המע"מ ועל הסכום כולל מע"מ =====
+// משירות 17 מינוס על סכום המע"מ או על הסכום כולל מע"מ מסמן זיכוי גם כשהכותרת
+// נחתכה. הבדל בערך של השדות האלה הוא מידע בלבד (שירות 18), אבל הבדל בסימן הוא
+// ההבדל בין קליטת סחורה לזיכוי — ולכן מסלים, כמו בשירות 17.
+test('v18: a minus only one read saw on the VAT or the total still escalates, in either order, under both flags', async () => {
+  const plain = doc();
+  const signed = doc({ vatAmount: -9, totalInclVat: -59 });
+  const marks = (a, b) => scanConsensusDiff(scan(a), scan(b)).map(diff => [diff.field, diff.trigger ?? true]);
+  assert.deepEqual(marks(plain, signed), [['vatAmount', true], ['totalInclVat', true]]);
+  assert.deepEqual(marks(signed, plain), [['vatAmount', true], ['totalInclVat', true]]);
+  assert.deepEqual(marks(doc({ totalInclVat: -59 }), plain), [['totalInclVat', true]]);
+  assert.deepEqual(marks(doc({ vatAmount: null }), doc({ vatAmount: -9 })), [['vatAmount', true]], 'a value not read is not a minus');
+  // אותו סימן — מידע בלבד, כמו קודם.
+  assert.deepEqual(marks(plain, doc({ vatAmount: 9.01, totalInclVat: 59.01 })), [['vatAmount', false], ['totalInclVat', false]]);
+  assert.deepEqual(marks(signed, doc({ vatAmount: -9.01, totalInclVat: -59.01 })), [['vatAmount', false], ['totalInclVat', false]]);
+  assert.deepEqual(marks(doc({ vatAmount: null }), plain), [['vatAmount', false]]);
+  for (const extraBody of [{}, APP_142]) {
+    for (const [first, second] of [[plain, signed], [signed, plain]]) {
+      const label = JSON.stringify(extraBody) + ' consensus_1 vat ' + first.vatAmount;
+      const { output, calls } = await request([answer(first), answer(second), answer(signed)], input, {}, extraBody);
+      assert.equal(calls.length, 3, label + ': the sign difference escalates');
+      assert.equal(output.consensus.agreed, false, label);
+      assert.equal(output.consensus.reason, 'reads_disagree', label);
+      assert.deepEqual(output.consensus.diffs.map(diff => [diff.field, diff.trigger]), [['vatAmount', undefined], ['totalInclVat', undefined]], label);
+      assert.equal(output.consensus.escalationSelected, true, label + ': every paper closes, so the strong read decides');
+      assert.equal(output.scan.documents[0].vatAmount, -9, label);
+      assert.equal(output.paperValidation[0].receivable, false, label);
+      assert.match(output.paperValidation[0].review.join(' '), /כנראה חשבונית זיכוי/, label);
+      const note = calls[2].input[1].content.at(-1).text;
+      assert.ok(note.includes('מסמך noteIndex=0: vatAmount, totalInclVat.'), note);
+      assert.ok(!note.includes('-9') && !note.includes('-59'), note);
+    }
+  }
+  // הבדל ערך באותו סימן עדיין אינו עולה קריאה.
+  const value = await request([answer(signed), answer(doc({ vatAmount: -9.01, totalInclVat: -59.01 }))]);
+  assert.equal(value.calls.length, 2);
+  assert.equal(value.output.consensus.agreed, true);
+  assert.equal(value.output.paperValidation[0].receivable, false);
+});
+
+// ===== מיזוג: מדד הנייר אינו מעניש קריאה ששמרה את המינוס =====
+// זיכוי עם כותרת חתוכה, סיכום -80 ושתי שורות. בדיקת הנייר של שירות 17 סוגרת אותו
+// בערך מוחלט; המדד שמשווה קריאות חייב למדוד מול אותו סכום, אחרת קריאה ששמרה את
+// המינוס ונכשלה בדבר אחר "רחוקה" 160 ₪, וקריאה שהשמיטה אותו נבחרת.
+const creditPaper = (quantities, sign = -1) => doc({ itemsPrintedLines: 2, subtotalExVat: 80 * sign, vatAmount: 14.4 * sign, totalInclVat: 94.4 * sign,
+  rows: quantities.map((quantity, index) => row({ code: String(111 * (index + 1)), lineNumber: index + 1, quantity, lineTotalExVat: 40 })) });
+test('v18: keeping the minus costs no paper error, also when the paper fails for another reason', async () => {
+  const keptOne = creditPaper([9, 8]);
+  const mismatch = scanChecksumMismatches(scan(keptOne), input);
+  assert.equal(mismatch.length, 1);
+  assert.deepEqual([mismatch[0].got, mismatch[0].expected], [80, 80], 'measured against the amount the paper closes on');
+  assert.equal(tnuvaPaperCheck(keptOne, 1).amount, -80, 'the printed amount is still returned with its sign');
+  assert.equal(tnuvaPaperCheck(keptOne, 1).checkedAmount, 80);
+  // נייר מעורב שההחזרות בו גדולות מהסחורה נסגר בסימן שלו, ונמדד מולו.
+  const mixed = doc({ itemsSectionTotalExVat: 50, returnsSectionTotalExVat: 80, returnsPrintedLines: 1, subtotalExVat: -30, vatAmount: -5.4, totalInclVat: -35.4,
+    rows: [row({ quantity: 11 }), row({ section: 'returns', quantity: 16, lineTotalExVat: 80 })] });
+  assert.deepEqual(scanChecksumMismatches(scan(mixed), input).map(item => [item.got, item.expected]), [[-30, -30]]);
+  assert.equal(tnuvaPaperCheck(doc(), 1).checkedAmount, 50);
+  assert.equal(tnuvaPaperCheck(doc({ subtotalExVat: null }), 1).checkedAmount, null);
+  // הקריאה ששמרה את המינוס עם פחות בעיות גוברת על זו שהשמיטה אותו — עם הדגל ובלעדיו.
+  const dropped = creditPaper([9, 9], 1);
+  const strong = creditPaper([8, 9]);
+  for (const extraBody of [{}, APP_142]) {
+    const label = JSON.stringify(extraBody);
+    const { output, calls } = await request([answer(keptOne), answer(dropped), answer(strong), answer(keptOne)], input, {}, extraBody);
+    assert.equal(calls.length, 4, label + ': escalation, then the checksum retry of the selected read');
+    assert.equal(output.consensus.escalationSelected, true, label);
+    assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected]),
+      [['consensus_1', false], ['consensus_2', false], ['consensus_escalation', true], ['checksum_retry', false]], label);
+    if (extraBody.strongReadSelection) assert.deepEqual(output.scanAudit.attempts.slice(0, 3).map(a => a.paperError), [1, 2, 1], label);
+    assert.equal(output.scan.documents[0].subtotalExVat, -80, label);
+    assert.match(output.paperValidation[0].review.join(' '), /כנראה חשבונית זיכוי/, label);
+  }
+  // וגם קריאת ההצלה של סכום הביקורת: קריאה חוזרת שהשמיטה את המינוס, עם אותו מספר
+  // בעיות, אינה גוברת על הקריאה ששמרה אותו (שירות 17: קריאה חוזרת אינה "מתקנת" מינוס).
+  const retried = await request([...agreed(keptOne), answer(creditPaper([9, 8], 1))]);
+  assert.equal(retried.calls.length, 3);
+  assert.equal(retried.output.checksumRetryAttempted, true);
+  assert.deepEqual(retried.output.scanAudit.attempts.map(a => [a.stage, a.selected]), [['consensus_1', true], ['consensus_2', false], ['checksum_retry', false]]);
+  assert.equal(retried.output.scan.documents[0].subtotalExVat, -80);
+  assert.match(retried.output.paperValidation[0].review.join(' '), /כנראה חשבונית זיכוי/);
+});
+
+// ===== מיזוג: תאריך התעודה מול אפליקציה ישנה =====
+// אפליקציה 141 ומטה בודקת מבצעים (וכרטיס "המבצע לא הופעל") לפי docDate של הנייר
+// כפי שהוא, ואינה מכירה את docDateUnconfirmed. בלי הדגל הבדל בתאריך מסלים כמו
+// בשירות 17, וקריאת ההכרעה מכריעה אותו; רק אפליקציה 142, שיודעת לעבור להיום,
+// חוסכת את הקריאה.
+test('v18: without the flag a date difference escalates as in service 17; with it, it costs nothing', async () => {
+  const dated = docDate => answer(doc({ docDate }));
+  const old = await request([dated('17.10.2026'), dated('11.10.2026'), dated('11.10.2026')]);
+  assert.equal(old.calls.length, 3, 'an old app gets the strong read to settle the date');
+  assert.equal(old.output.consensus.agreed, false);
+  assert.equal(old.output.consensus.reason, 'reads_disagree');
+  assert.deepEqual(old.output.consensus.diffs, [{ noteIndex: 0, scope: 'document', field: 'docDate', values: ['17.10.2026', '11.10.2026'] }]);
+  assert.equal(old.output.consensus.escalationSelected, true);
+  assert.equal(old.output.scan.documents[0].docDate, '11.10.2026');
+  assert.deepEqual(old.output.consensus.docDateUnconfirmed, [], 'the second cheap read confirms the date the strong read settled');
+  const note = old.calls[2].input[1].content.at(-1).text;
+  assert.ok(note.includes('מסמך noteIndex=0: docDate.'), note);
+  assert.ok(!note.includes('17.10.2026') && !note.includes('11.10.2026'), note);
+  // גם צורת כתיבה אחרת, וגם כותרת שנחתכה עם התאריך — כמו בשירות 17.
+  const format = await request([dated('17/09/2026'), dated('17.09.2026'), dated('17/09/2026')]);
+  assert.equal(format.calls.length, 3);
+  const { docNumber: unusedNumber, ...noNumber } = doc();
+  const cut = await request([answer(doc()), answer({ ...noNumber, docType: 'unknown', docDate: null }), answer(doc())]);
+  assert.equal(cut.calls.length, 3);
+  assert.deepEqual(cut.output.consensus.diffs.map(diff => [diff.field, diff.trigger]), [['docDate', undefined]], 'the cut type still costs nothing');
+  assert.equal(cut.output.paperValidation[0].receivable, true);
+  // עם הדגל: אין קריאה שלישית, ההבדל מסומן trigger:false, והאפליקציה יודעת שהתאריך אינו מאושר.
+  const fresh = await request([dated('17.10.2026'), dated('11.10.2026')], input, {}, APP_142);
+  assert.equal(fresh.calls.length, 2);
+  assert.equal(fresh.output.consensus.agreed, true);
+  assert.deepEqual(fresh.output.consensus.diffs, [{ noteIndex: 0, scope: 'document', field: 'docDate', values: ['17.10.2026', '11.10.2026'], trigger: false }]);
+  assert.equal(fresh.output.scan.documents[0].docDate, '17.10.2026');
+  assert.deepEqual(fresh.output.consensus.docDateUnconfirmed, [0]);
+  // שאר שדות המידע אינם תלויים בדגל.
+  for (const extraBody of [{}, APP_142]) {
+    const vat = await request([answer(doc()), answer(doc({ vatPct: 17, vatAmount: 8.5, totalInclVat: 58.5, roundingDiff: .02 }))], input, {}, extraBody);
+    assert.equal(vat.calls.length, 2, JSON.stringify(extraBody));
   }
 });
 

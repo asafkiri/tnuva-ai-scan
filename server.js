@@ -63,7 +63,8 @@ export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // הכרעת המשתמש 30.7 (יטבתה, תקפה גם כאן): יציבות מעל עלות — אותו מודל,
 // אותה רזולוציה, אותה ארכיטקטורת קריאה-חוזרת. אין דגם זול יותר ואין תמונה קטנה יותר.
 // v17: No document number; an unreadable header is a regular document and does not escalate.
-// v18: Consensus escalates only on decision fields; the strong read is independent, and when the
+// v18: Consensus escalates only on decision fields (a VAT/total sign difference is one; the date is one
+// unless the client sends strongReadSelection:true); the strong read is independent, and when the
 // client sends strongReadSelection:true it must also beat the paper.
 const SERVICE_VERSION = 18;
 // v13: עבודת סריקה נשמרת חצי שעה אחרי שהסתיימה, ושעה לכל היותר מרגע שנפתחה.
@@ -426,9 +427,15 @@ export function tnuvaPaperCheck(input, pageCount) {
   if (credit) review.push('זו חשבונית זיכוי — יש להזין אותה במסך החזרות, ולא כקליטת סחורה');
   if (returnLines || (returnSummary != null && returnSummary !== 0)) review.push('התעודה כוללת החזרות. יש להפריד אותן לפי תהליך ההחזרות הקיים ולהזין ידנית את נתוני הקליטה');
   if (!credit && (minusSummary || (subtotal != null && subtotal <= 0))) review.push('סכום התעודה אינו חיובי — כנראה חשבונית זיכוי; יש להזין אותה במסך החזרות, ולא כקליטת סחורה');
+  // שירות 18: הסכום שהשורות נמדדות מולו בפועל — בערך מוחלט לזיכוי, ובנייר שנסגר
+  // בסימן שלו (החזרות גדולות מהסחורה) הסימן שלו, לפי הקרוב לסכום השורות. amount
+  // נשאר הסכום המודפס עם הסימן. מדד הנייר שמשווה קריאות נמדד מול checkedAmount,
+  // כדי שקריאה ששמרה את המינוס ונכשלה בדבר אחר לא תיראה רחוקה פי שניים מהסכום.
+  const checked = expected != null && minusSummary && Math.abs(net - subtotal) < Math.abs(net - expected) ? subtotal : expected;
   return { ok: problems.length === 0, receivable: !problems.length && !review.length,
     problems, review, missingSummary, retryable: problems.length > 0 && !missingSummary,
-    amount: subtotal == null ? null : subtotal / 100, lines: printedLines == null ? null : printedLines,
+    amount: subtotal == null ? null : subtotal / 100, checkedAmount: checked == null ? null : checked / 100,
+    lines: printedLines == null ? null : printedLines,
     units, rowAmount: net / 100, rowLines: itemLines, returnLines, promo: promo / 100 };
 }
 
@@ -439,8 +446,11 @@ export function scanChecksumMismatches(scan, inputDocuments) {
     if (!input) continue;
     if (!Number.isFinite(input.expectedSubtotalExVat)) {
       const check = tnuvaPaperCheck(doc, input.pages.length);
+      // שירות 18: מול הסכום שהנייר נבדק מולו (checkedAmount) ולא מול הסכום המודפס
+      // עם הסימן — אחרת זיכוי ששמר את המינוס נמדד ‎−80 מול 80 ו"מתרחק" 160 ₪, וקריאה
+      // חוזרת או קריאה זולה שהשמיטה את המינוס גוברת עליו.
       if (!check.ok) out.push({ noteIndex: doc.noteIndex, got: check.rowAmount,
-        expected: check.amount || 0, gotLines: check.rowLines, expectedLines: check.lines,
+        expected: check.checkedAmount || 0, gotLines: check.rowLines, expectedLines: check.lines,
         promo: check.promo, missingSummary: check.missingSummary, retryable: check.retryable,
         problems: check.problems, photoFirst: true });
       continue;
@@ -538,8 +548,12 @@ const CONSENSUS_DOC_FIELDS = ["docDate", "docType", "pageCount", "vatPct", "item
 // המע"מ, הסכום כולל מע"מ והפרש העיגול משמשים בלקוח לאזהרה ולרמז תצוגה בלבד —
 // החישובים נשענים על הגדרת האפליקציה ועל הנטו המודפס. הבדל בשדות האלה נמסר
 // ב-diffs עם trigger:false ואינו מסלים. הכוכבית נשארת: הלקוח משייך לפיה מוצר
-// בין תאומים במחיר, ומכריע לפיה מבצע שחסר במאגר.
+// בין תאומים במחיר, ומכריע לפיה מבצע שחסר במאגר. שני יוצאים מהכלל, ראו
+// consensusTrigger: הבדל בסימן של סכום המע"מ או של הסכום כולל מע"מ, ותאריך
+// שנחלקו עליו בסריקה של לקוח שלא שלח strongReadSelection:true.
 const CONSENSUS_INFORMATIONAL_FIELDS = new Set(["docDate", "sourcePage", "vatPct", "vatAmount", "totalInclVat", "roundingDiff"]);
+// משירות 17 מינוס על אחד מהם מסמן זיכוי גם בלי כותרת (tnuvaPaperCheck).
+const CONSENSUS_SIGN_FIELDS = new Set(["vatAmount", "totalInclVat"]);
 const CONSENSUS_MONEY_FIELDS = new Set(["unitPriceExVat", "lineTotalExVat", "itemsSectionTotalExVat", "promoDiscountExVat",
   "returnsSectionTotalExVat", "subtotalExVat", "vatAmount", "totalInclVat", "roundingDiff"]);
 const MAX_CONSENSUS_DIFFS = 200;
@@ -630,9 +644,22 @@ export function alignConsensusRows(rowsA, rowsB) {
 // כל ההבדלים בין שתי קריאות של אותו צילום. rowIndex הוא מיקום השורה בקריאה
 // הראשונה (זו שנבחרה, כשמשווים מולה), otherRowIndex — בשנייה; שורה שרק צד
 // אחד ראה מקבלת null בצד השני והבדל בשדה "row".
-// v18: הבדל בשדה מידע מסומן trigger:false — הוא נמסר, אבל אינו מסלים.
-const consensusTrigger = field => CONSENSUS_INFORMATIONAL_FIELDS.has(field) ? { trigger: false } : {};
-function consensusDiffAll(first, second) {
+// v18: הבדל בשדה מידע מסומן trigger:false — הוא נמסר, אבל אינו מסלים. שני
+// יוצאים מהכלל, שניהם מהמיזוג עם שירות 17:
+// - סכום המע"מ והסכום כולל מע"מ: הבדל בערך באותו סימן הוא מידע, אבל קריאה אחת
+//   שראתה מינוס מול קריאה שלא ראתה הוא ההבדל בין קליטת סחורה לזיכוי. הוא מסלים,
+//   כמו בשירות 17 — אחרת, כשהקריאה שהשמיטה את המינוס היא הראשונה, הזיכוי נקלט
+//   כסחורה. ערך שלא נקרא (null) אינו מינוס, כמו ב-tnuvaPaperCheck.
+// - התאריך אינו מסלים רק כשהלקוח שלח strongReadSelection:true (docDateTriggers
+//   false): אפליקציה 142 יודעת לעבור להיום כשהתאריך אינו מאושר. אפליקציה עד 141
+//   בודקת מבצעים לפי התאריך כפי שנקרא, ולכן אצלה הבדל בתאריך מסלים כמו בשירות 17.
+const consensusNegative = (field, value) => { const cents = consensusValue(field, value); return cents !== null && cents < 0; };
+function consensusTrigger(field, valueA, valueB, options = {}) {
+  if (field === "docDate" && options.docDateTriggers === true) return {};
+  if (CONSENSUS_SIGN_FIELDS.has(field) && consensusNegative(field, valueA) !== consensusNegative(field, valueB)) return {};
+  return CONSENSUS_INFORMATIONAL_FIELDS.has(field) ? { trigger: false } : {};
+}
+function consensusDiffAll(first, second, options = {}) {
   const out = [];
   const docsA = (first && first.documents) || [], docsB = (second && second.documents) || [];
   const noteIndexes = [...new Set([...docsA, ...docsB].map(doc => Number(doc && doc.noteIndex)))].sort((a, b) => a - b);
@@ -642,7 +669,7 @@ function consensusDiffAll(first, second) {
     if (!a || !b) { out.push({ noteIndex, scope: "document", field: "document", values: [a ? "נקרא" : null, b ? "נקרא" : null] }); continue; }
     for (const field of CONSENSUS_DOC_FIELDS) {
       if (consensusValue(field, a[field]) !== consensusValue(field, b[field])) {
-        out.push({ noteIndex, scope: "document", field, values: [a[field] ?? null, b[field] ?? null], ...consensusTrigger(field) });
+        out.push({ noteIndex, scope: "document", field, values: [a[field] ?? null, b[field] ?? null], ...consensusTrigger(field, a[field], b[field], options) });
       }
     }
     const rowsA = Array.isArray(a.rows) ? a.rows : [], rowsB = Array.isArray(b.rows) ? b.rows : [];
@@ -659,15 +686,15 @@ function consensusDiffAll(first, second) {
       const lineNumber = Number(rowA.lineNumber) || pair.a + 1;
       for (const field of CONSENSUS_ROW_FIELDS) {
         if (consensusValue(field, rowA[field]) !== consensusValue(field, rowB[field])) {
-          out.push({ noteIndex, scope: "row", rowIndex: pair.a, otherRowIndex: pair.b, lineNumber, field, values: [rowA[field] ?? null, rowB[field] ?? null], ...consensusTrigger(field) });
+          out.push({ noteIndex, scope: "row", rowIndex: pair.a, otherRowIndex: pair.b, lineNumber, field, values: [rowA[field] ?? null, rowB[field] ?? null], ...consensusTrigger(field, rowA[field], rowB[field], options) });
         }
       }
     }
   }
   return out;
 }
-export function scanConsensusDiff(first, second) {
-  return consensusDiffAll(first, second).slice(0, MAX_CONSENSUS_DIFFS);
+export function scanConsensusDiff(first, second, options = {}) {
+  return consensusDiffAll(first, second, options).slice(0, MAX_CONSENSUS_DIFFS);
 }
 // השורות שנותרו במחלוקת ביחס לקריאה שנבחרה — זה מה שהלקוח מעלה לאישור ידני.
 // שדה בשורה שנוי במחלוקת רק כשקריאה אחרת קראה אותו אחרת ואף קריאה אחרת אינה
@@ -2093,8 +2120,9 @@ function decodeAnalyzeClaims(result, aliasToId) {
           consensus.reason = 'read_failed';
         } else {
           // v18: ההסכמה נמדדת על השדות שמשנים החלטה. הבדל בשדה מידע בלבד נמסר
-          // ב-diffs (trigger:false) ואינו עולה קריאה במודל היקר.
-          const diffs = consensusDiffAll(goodReads[0].scan, goodReads[1].scan);
+          // ב-diffs (trigger:false) ואינו עולה קריאה במודל היקר. תאריך — רק כשהלקוח
+          // שלח את הדגל; בלעדיו הוא מסלים כמו בשירות 17 (ראו consensusTrigger).
+          const diffs = consensusDiffAll(goodReads[0].scan, goodReads[1].scan, { docDateTriggers: !strongReadSelection });
           triggers = diffs.filter(diff => diff.trigger !== false);
           consensus.diffs = diffs.slice(0, MAX_CONSENSUS_DIFFS);
           consensus.agreed = triggers.length === 0;
