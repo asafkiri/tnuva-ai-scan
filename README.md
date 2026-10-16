@@ -580,6 +580,14 @@ unchanged.
 `npm test` runs deterministic arithmetic and the actual HTTP handler with
 fixture Firebase signatures and mocked model responses. No paid requests.
 
+Deployment to Cloud Run is automatic: a Cloud Build trigger runs on every merge
+to `main` and reports on the merge commit as a GitHub check. The trigger lives
+in GCP and is not visible in this repository, so do not add a second deploy
+pipeline. A green merge alone does not prove the new revision is serving; open
+`/health` and check `serviceVersion`. Service 19 was confirmed this way on
+16.10 (`serviceVersion:19`, `secondStrongRead:true`). The trigger does not run
+the tests, so run `npm test` before merging.
+
 Service 19 can be deployed before or after any app. It adds the
 `consensus.secondStrongRead` record and the `second_strong_read` stage in
 `scanAudit.attempts`, and it only removes entries from
@@ -615,8 +623,8 @@ read other than the selected one read the same calendar day: either cheap date
 after a completed escalation or a winning checksum retry, and the second cheap
 date when the first cheap read was selected. It takes the selected read from
 `scanAudit.attempts` and, without it, from the service-16 meaning of
-`escalated`. Otherwise the date is treated as disputed. Deploy this source to
-the existing `tnuva-ai-scan` service whenever it is ready, before or after app
+`escalated`. Otherwise the date is treated as disputed. Merging to `main`
+deploys it to the existing `tnuva-ai-scan` service, before or after app
 142. `/health` must report `serviceVersion:19` (18 for service 18 itself), `strongReadSelection:true`,
 `resumableScans:true`, `photoFirst:true`, `scanAuditVersion:1`,
 `keyStatus:"ready"`, and `retryModel:"gpt-5.6-terra"` — without a retry model
