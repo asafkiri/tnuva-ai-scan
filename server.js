@@ -68,8 +68,9 @@ export const OPENAI_NETWORK_RETRY_WINDOW_MS = 60_000;
 // unless the client sends strongReadSelection:true); the strong read is independent, and when the
 // client sends strongReadSelection:true it must also beat the paper.
 // v19: A quantity or price field the strong read selected, on which the cheap reads disagreed and
-// none confirms it, gets one more strong read in the checksum-retry slot; if it reads the same value
-// and the paper proves itself, the field is accepted. SECOND_STRONG_READ=off restores service 18.
+// none confirms it, gets one more strong read of the whole note in the checksum-retry slot, when that
+// slot is free; if its whole read is identical to the selected one and the paper and the row close,
+// the field is accepted. SECOND_STRONG_READ=off restores service 18.
 const SERVICE_VERSION = 19;
 // v13: עבודת סריקה נשמרת חצי שעה אחרי שהסתיימה, ושעה לכל היותר מרגע שנפתחה.
 // זה מכסה בנוחות טלפון שנפל וחוזר, ואינו מחזיק זיכרון מעבר לכך.
@@ -905,22 +906,27 @@ function consensusCorrectiveText(diffs, reads = []) {
 // מסכים בו עם אף אחת מהן — קריאה חזקה שנייה, ואם היא קוראת אותו כמו Terra הוא
 // מתקבל בלי פעולה של העובד. אחרת העובד מאשר או מתקן, כמו היום. "מתקבל" הוא לפי
 // שדה ושורה, לעולם לא לפי תעודה שלמה.
-// הקריאה השנייה רק מצביעה: הערך תמיד של הקריאה שנבחרה, היא לעולם אינה נבחרת,
-// ואינה מוסיפה שום מחלוקת. היא נספרת רק כשהקריאה שנבחרה היא Terra עצמו — כשקריאה
-// זולה נבחרה לפי הנייר, Terra כבר חלק עליה, ושתי קריאות חזקות שאינן מסכימות זו עם
-// זו אינן מאשרות דבר. חמשת התנאים:
+// הכרעת הבעלים הסופית — איך Terra#2 מכריעה: היא קוראת את כל התעודה מחדש, והקריאה שלה
+// כולה מושווית לקריאה של Terra כולה (scanSecondStrongWholeReadDifferences): אותן תעודות,
+// אותו מספר שורות באותו סדר, ובכל שורה אותו מקטע, קוד, כמות, מחיר יחידה וסכום שורה, ואותם
+// שדות סיכום שהקונצנזוס משווה — בנרמול של consensusValue. רק כשהן זהות נסגר כל שדה שנשאל
+// ועומד ב-C1 וב-C2; הבדל אחד בכל מקום — שום דבר אינו נסגר (not_identical). מתי היא נשאלת
+// לא השתנה (scanSecondStrongPlan), וכל ההתאמה לשורה המודפסת למטה משמשת רק להחלטה אם לשאול.
+// Terra#2 לעולם אינה הקריאה שנבחרה: הערך תמיד של Terra, והיא אינה מוסיפה שום מחלוקת. היא
+// נשאלת רק כשהקריאה שנבחרה היא Terra עצמו — כשקריאה זולה נבחרה לפי הנייר, Terra כבר חלק
+// עליה, ושתי קריאות חזקות שאינן מסכימות זו עם זו אינן מאשרות דבר. חמשת התנאים:
 // C1 — הנייר מוכיח את עצמו: התעודה שנבחרה נסגרת מול "סהכ חייב מעמ" ומונה "פריטים"
 //      המודפסים (tnuvaPaperCheck), ובשורה עצמה כמות × מחיר = סכום (tnuvaRowArithmetic).
 // C2 — רק כמות, מחיר יחידה וסכום שורה של שורת פריטים רגילה: לא קוד, לא כוכבית, לא
 //      מקטע, לא קיום שורה, לא שדות סיכום; לא החזרות, לא פיקדון, לא זיכוי ולא נייר
-//      מעורב (כל תעודה שאינה receivable) — בכל קריאה, לא רק בזו שנבחרה, וגם בקריאה
-//      השנייה עצמה; ולא שורה שהזהות שלה פתוחה (ראו scanSecondStrongPlan).
+//      מעורב (כל תעודה שאינה receivable) — וכשקריאה זולה ראתה זיכוי, החזרות או פיקדון השדה
+//      אינו נשאל; ולא שורה שהזהות שלה פתוחה (ראו scanSecondStrongPlan).
 // C3 — ההנחיה נותנת רק מקומות ואת הכשל הידוע, אף פעם לא ערך שנקרא; המודל החזק, מאמץ גבוה.
 // C4 — כל שדה שנשאל נרשם ב-consensus.secondStrongRead וביומן invoice_scan_audit, עם הערך שכל
-//      קריאה ראתה בשורה המודפסת שנשאלה, וגם כל שדה שעמד בתנאים ולא נשאל — עם הסיבה.
+//      קריאה ראתה, ההבדלים הראשונים כשהקריאה אינה זהה, וגם כל שדה שעמד בתנאים ולא נשאל — עם הסיבה.
 // C5 — SECOND_STRONG_READ=off מחזיר את שירות 18 כפי שהיה.
-// מהביקורת (סבב שלישי): "מה קריאה ראתה בשורה שנשאלה" — של הזולות ושל הקריאה השנייה — הוא
-// השורה המודפסת עצמה, ולא השורה שהיישור של diffs מצמיד אליה (ראו secondStrongMatch).
+// מהביקורת (סבב שלישי): "מה קריאה זולה ראתה בשורה שנשאלה" הוא השורה המודפסת עצמה, ולא השורה
+// שהיישור של diffs מצמיד אליה (ראו secondStrongMatch).
 const SECOND_STRONG_FIELDS = new Set(["quantity", "unitPriceExVat", "lineTotalExVat"]);
 const SECOND_STRONG_RULE = "second_strong_read";
 const secondStrongDeposit = row => /פ.?קדון/.test(String((row && row.description) || ""));
@@ -931,11 +937,14 @@ function secondStrongEligible(doc, row, field, pageCount) {
   // receivable = הנייר נסגר וגם אין בו זיכוי, החזרות, מינוס בסיכום או סכום שאינו חיובי.
   return tnuvaPaperCheck(doc, pageCount).receivable === true && tnuvaRowArithmetic(row) === true;
 }
-// ===== v19, מהביקורת (סבב שלישי): השורה המודפסת שנשאלה =====
+// ===== v19, מהביקורת (סבב שלישי): השורה המודפסת שנשאלה — רק כדי להחליט אם לשאול =====
+// מהכרעת הבעלים הסופית כל מה שבחלק הזה משמש רק את הצד של השאלה (scanSecondStrongPlan): מה כל
+// קריאה זולה ראתה בשורה המודפסת שנשאלה. Terra#2 אינה מותאמת כאן לשום שורה — הקריאה שלה כולה
+// מושווית לקריאה של Terra (scanSecondStrongWholeReadDifferences).
 // עד כאן הקריאה של כל עד "בשורה שנשאלה" נלקחה מהיישור של diffs: לפי מיקום כשמספר השורות
 // שווה, ולפי תוכן כשאינו שווה. היישור הזה מצמיד שורות מודפסות שונות כשקריאה משנה את סדר
-// השורות, מדלגת על שורה ומכפילה אחרת, או מסיטה את עמודת הקוד — וגם התנאים של הצד הזול (נחלקו?
-// אף אחת אינה מאשרת?) וגם הקול של הקריאה השנייה נלקחו אז משורה שהיא לא קראה. בשלב 3 בלבד —
+// השורות, מדלגת על שורה ומכפילה אחרת, או מסיטה את עמודת הקוד — והתנאים של הצד הזול (נחלקו?
+// אף אחת אינה מאשרת?) נלקחו אז משורה שהיא לא קראה. בשלב 3 בלבד —
 // disputedRows, 2 מתוך 3 וכל השאר של שירות 18 אינם משתנים — קריאה נספרת לשורה המודפסת שנשאלה
 // רק כשיש לה בדיוק שורה אחת באותו עמוד ובאותו מספר שורה מודפס, השורה הזאת נושאת את הקוד של
 // השורה שנבחרה, והקוד הזה מופיע בתעודה בשורה אחת בלבד — גם בקריאה שנבחרה וגם בקריאה הזאת
@@ -1057,7 +1066,7 @@ function secondStrongMatch(selectedScan, selectedDoc, row, otherScan) {
   if (rows.filter(item => secondStrongCode(item) === code).length !== 1) return { unmatched: "code_repeated" };
   return { row: atLine[0], doc: otherDoc };
 }
-// C2 על הקריאה האחרת עצמה: תעודה שהיא ראתה כזיכוי, עם מינוס או עם החזרות (review של
+// C2 על הקריאה הזולה עצמה: תעודה שהיא ראתה כזיכוי, עם מינוס או עם החזרות (review של
 // tnuvaPaperCheck, שאינו תלוי במספר העמודים), או השורה שהיא קראה כהחזרה או כפיקדון.
 function secondStrongIneligible(otherDoc, otherRow) {
   if (tnuvaPaperCheck(otherDoc, 1).review.length > 0) return "credit_or_returns";
@@ -1065,7 +1074,7 @@ function secondStrongIneligible(otherDoc, otherRow) {
   if (secondStrongDeposit(otherRow)) return "deposit_row";
   return null;
 }
-// מה קריאה אחת ראתה בשדה של השורה המודפסת שנשאלה, כפי שנרשם ב-reads: {stage, value} כשהיא
+// מה קריאה זולה אחת ראתה בשדה של השורה המודפסת שנשאלה, כפי שנרשם ב-reads: {stage, value} כשהיא
 // נספרת; {stage, value:null, seen:false} כשלא ראתה את השורה, ועם unmatched כשלא הותאמה — לפי הנייר,
 // לפי השורה או לפי הטבלה; ועם ineligible (והערך שקראה) כשקראה אותה אבל לא כשורת פריטים רגילה של קליטה.
 // counts — האם נספרת. selectedScan ו-otherScan — הסריקות כולן (המסמך נמצא לפי הנייר, לא רק לפי התווית).
@@ -1095,6 +1104,8 @@ function secondStrongReading(stage, selectedScan, selectedDoc, row, otherScan, f
 //   עליהן אינו נעשה צודק כשקריאה חזקה שנייה חוזרת על אותה טעות). עם שתי קריאות זולות: שתיהן
 //   מותאמות, עם ערך, ושונות; עם שלוש (OPENAI_CONSENSUS_READS=3): כל אלה שהושלמו, ולפחות שתיים,
 //   מותאמות, עם ערך, וכולן שונות זו מזו.
+// כל שדה — שנשאל או לא — נושא את הערך שנבחר ואת reads: הקריאה שנבחרה ומה שכל קריאה זולה ראתה
+// בשורה המודפסת שנשאלה (C4). בשדה שנסגר, הסגירה מוסיפה בסופו את Terra#2.
 // שורה שהקוד שלה במחלוקת ואף עד אינו מאשר את הקוד שנבחר (confirmed 0) — הזהות שלה פתוחה, והכמות
 // והכסף שלה נשארים לעובד יחד עם הקוד. אחרת הכרטיס היה נשאר עם הקוד בלבד, וכלל שתי הזהויות באותו
 // מחיר של האפליקציה היה סוגר אותו: הקריאה השנייה הייתה מכריעה זהות בעקיפין (C2).
@@ -1122,9 +1133,9 @@ export function scanSecondStrongPlan(selected, witnesses, inputDocuments) {
         : values.length < 2 || values.includes(null) ? "lone"
         : values.includes(consensusValue(item.field, value)) ? "cheap_confirms"
         : new Set(values).size < values.length ? "cheap_agree" : null;
-      if (reason === null) places.push(place);
-      else notAsked.push({ ...place, value, reads: [{ stage: selected.stage, value, selected: true }, ...cheap.map(reading => reading.read)],
-        reason, ...(unmatchable ? { unmatched: unmatchable } : {}) });
+      const entryReads = [{ stage: selected.stage, value, selected: true }, ...cheap.map(reading => reading.read)];
+      if (reason === null) places.push({ ...place, value, reads: entryReads });
+      else notAsked.push({ ...place, value, reads: entryReads, reason, ...(unmatchable ? { unmatched: unmatchable } : {}) });
     }
   }
   return { places, notAsked };
@@ -1133,33 +1144,84 @@ export function scanSecondStrongPlan(selected, witnesses, inputDocuments) {
 export function scanSecondStrongOpenFields(selected, witnesses, inputDocuments) {
   return scanSecondStrongPlan({ stage: null, scan: selected }, (witnesses || []).filter(Boolean).map(scan => ({ stage: null, scan })), inputDocuments).places;
 }
-// הספירה: לכל שדה שנשאל — מה שכל קריאה ראתה בשורה המודפסת שנשאלה (secondStrongReading), ואם
-// הקריאה החזקה השנייה הותאמה לשורה הזאת, קראה אותה כשורת פריטים רגילה, וקראה בדיוק את הערך
-// שנבחר — השדה נסגר בכלל second_strong_read. אחרת הוא פתוח, עם הסיבה: disagrees, not_seen,
-// not_matched (ובקריאה שלה unmatched), not_eligible (ובקריאה שלה ineligible) או failed —
-// extra=null, הקריאה נכשלה, ושום דבר אינו נסגר. selected, witnesses ו-extra הם {stage, scan}.
-export function scanSecondStrongReadVotes(selected, witnesses, extra, places) {
-  const reads = (witnesses || []).filter(item => item && item.scan);
+// ===== v19, הכרעת הבעלים הסופית: הקריאה כולה =====
+// מה מושווה בין הקריאה של Terra#2 לקריאה של Terra. בתעודה: סוג התעודה (זיכוי או לא), מספר העמודים
+// ושדות הסיכום ש-CONSENSUS_DOC_FIELDS משווה — בלי תאריך התעודה, שאינו שדה סיכום ושהבעלים קבע שאינו
+// מכריע דבר (v18). בשורה: הזהות — הקוד והסוג של השורה (פריטים או החזרות, ופיקדון או לא, שני הסוגים
+// ש-C2 מוציא) — והכמות, מחיר היחידה וסכום השורה. כל השאר אינו נמדד: התיאור (מעבר לפיקדון), ביטחון,
+// אזהרות, כוכבית מבצע, עמוד, ומספר השורה (בנייר של תנובה הוא הספירה של הקריאה עצמה — הסדר הוא
+// שמושווה). הנרמול הוא של הקונצנזוס (consensusValue): כמות לאלפית, כסף לאגורה, קוד בלי רווחים, זיכוי
+// מול כל השאר.
+const SECOND_STRONG_DOC_FIELDS = CONSENSUS_DOC_FIELDS.filter(field => field !== "docDate");
+const SECOND_STRONG_ROW_FIELDS = ["section", "deposit", "code", "quantity", "unitPriceExVat", "lineTotalExVat"];
+const secondStrongRowValue = (row, field) => field === "deposit" ? secondStrongDeposit(row) : consensusValue(field, row[field]);
+const secondStrongRawValue = (row, field) => field === "deposit" ? secondStrongDeposit(row) : row[field] ?? null;
+const SECOND_STRONG_MAX_DIFFERENCES = 10;
+// ההבדלים בין שתי קריאות שלמות, לפי הסדר: תעודה אחרי תעודה (לפי noteIndex); בכל תעודה קודם שדות
+// התעודה, אחר כך מספר השורות, ואז שורה מול שורה לפי הסדר (כשמספר השורות שונה אין שורה מול שורה).
+// מערך ריק — הקריאות זהות. נקטע אחרי limit הבדלים: היומן צריך את ההבדלים הראשונים, וההכרעה רק אם
+// יש הבדל. כל הבדל: {noteIndex, scope, field, values: [Terra, Terra#2]}, ובשורה גם rowIndex ו-lineNumber
+// (של הקריאה שנבחרה); field "document" — מספר המסמכים של כל קריאה בתווית הזאת, "rowCount" — מספר השורות,
+// "deposit" — האם התיאור הוא של פיקדון.
+export function scanSecondStrongWholeReadDifferences(selected, other, limit = SECOND_STRONG_MAX_DIFFERENCES) {
+  const out = [];
+  const full = item => { out.push(item); return out.length >= limit; };
+  const docsA = (selected && selected.documents) || [], docsB = (other && other.documents) || [];
+  const noteIndexes = [...new Set([...docsA, ...docsB].map(doc => Number(doc && doc.noteIndex)))].sort((a, b) => a - b);
+  for (const noteIndex of noteIndexes) {
+    const inA = docsA.filter(doc => Number(doc && doc.noteIndex) === noteIndex), inB = docsB.filter(doc => Number(doc && doc.noteIndex) === noteIndex);
+    if (inA.length !== 1 || inB.length !== 1) {
+      if (full({ noteIndex, scope: "document", field: "document", values: [inA.length, inB.length] })) return out;
+      continue;
+    }
+    const a = inA[0], b = inB[0];
+    for (const field of SECOND_STRONG_DOC_FIELDS) {
+      if (consensusValue(field, a[field]) !== consensusValue(field, b[field])
+        && full({ noteIndex, scope: "document", field, values: [a[field] ?? null, b[field] ?? null] })) return out;
+    }
+    const rowsA = secondStrongRows(a), rowsB = secondStrongRows(b);
+    if (rowsA.length !== rowsB.length) {
+      if (full({ noteIndex, scope: "document", field: "rowCount", values: [rowsA.length, rowsB.length] })) return out;
+      continue;
+    }
+    for (let rowIndex = 0; rowIndex < rowsA.length; rowIndex += 1) {
+      const rowA = rowsA[rowIndex] || {}, rowB = rowsB[rowIndex] || {};
+      for (const field of SECOND_STRONG_ROW_FIELDS) {
+        if (secondStrongRowValue(rowA, field) !== secondStrongRowValue(rowB, field)
+          && full({ noteIndex, scope: "row", rowIndex, lineNumber: Number(rowA.lineNumber) || rowIndex + 1, field,
+            values: [secondStrongRawValue(rowA, field), secondStrongRawValue(rowB, field)] })) return out;
+      }
+    }
+  }
+  return out;
+}
+// הסגירה. selected ו-extra הם {stage, scan}; extra=null — Terra#2 נכשלה, ושום דבר אינו נסגר. רק כשהקריאה
+// של Terra#2 כולה זהה לקריאה שנבחרה (differences ריק) נסגר כל שדה שנשאל ועומד ב-C1 וב-C2 בקריאה שנבחרה,
+// עם closedBy: 'second_strong_read'. אחרת השדה פתוח, עם הסיבה: not_identical (ההבדלים הראשונים ב-differences),
+// not_eligible (C1 או C2 אינם מתקיימים — מול קריאה זהה, בפועל רק כשקוראים לפונקציה עם שדה כזה) או failed.
+// reads (C4): הקריאה שנבחרה ומה שכל קריאה זולה ראתה (מהתוכנית, place.reads), ובשדה שנסגר גם Terra#2 — הערך
+// שלה באותו מקום בטבלה, שבקריאה זהה שווה לערך שנבחר. בשדה פתוח Terra#2 אינה נרשמת לפי שדה: ההכרעה לא הייתה
+// על השדה, ומה שהיא קראה אחרת מופיע ב-differences.
+export function scanSecondStrongReadClosures(selected, extra, places, inputDocuments) {
+  const selectedScan = selected && selected.scan;
+  const read = Boolean(extra && extra.scan);
+  const differences = read ? scanSecondStrongWholeReadDifferences(selectedScan, extra.scan) : [];
   const closed = [], open = [];
   for (const place of places || []) {
-    const doc = secondStrongDocOf(selected && selected.scan, place.noteIndex);
+    const doc = secondStrongDocOf(selectedScan, place.noteIndex);
     const row = secondStrongRows(doc)[place.rowIndex] || null;
     const value = row ? row[place.field] ?? null : null;
-    const entryReads = [{ stage: selected.stage, value, selected: true }]
-      .concat(reads.map(item => secondStrongReading(item.stage, selected.scan, doc, row, item.scan, place.field).read));
-    let reason = "failed";
-    if (extra && extra.scan) {
-      const vote = secondStrongReading(extra.stage, selected.scan, doc, row, extra.scan, place.field);
-      entryReads.push(vote.read);
-      reason = vote.read.seen === false ? (vote.read.unmatched ? "not_matched" : "not_seen")
-        : !vote.counts ? "not_eligible"
-        : value !== null && consensusValue(place.field, vote.read.value) === consensusValue(place.field, value) ? null : "disagrees";
-    }
-    const entry = { ...place, value, reads: entryReads };
-    if (reason === null) closed.push({ ...entry, rule: SECOND_STRONG_RULE });
-    else open.push({ ...entry, reason });
+    const input = (inputDocuments || []).find(item => Number(item && item.noteIndex) === Number(place.noteIndex));
+    const pages = input && Array.isArray(input.pages) ? input.pages.length : 0;
+    const { reads: planned, value: unusedValue, ...where } = place;
+    const reads = Array.isArray(planned) ? planned : [{ stage: selected.stage, value, selected: true }];
+    const reason = !read ? "failed" : differences.length ? "not_identical"
+      : !secondStrongEligible(doc, row, place.field, pages) ? "not_eligible" : null;
+    if (reason !== null) { open.push({ ...where, value, reads, reason }); continue; }
+    const extraRow = secondStrongRows(secondStrongDocOf(extra.scan, place.noteIndex))[place.rowIndex];
+    closed.push({ ...where, value, reads: reads.concat([{ stage: extra.stage, value: extraRow[place.field] ?? null }]), closedBy: SECOND_STRONG_RULE });
   }
-  return { closed, open };
+  return { closed, open, differences };
 }
 // שדה שנסגר יוצא מ-disputedRows; שורה שלא נשאר בה שדה יוצאת כולה.
 function withoutSecondStrongClosures(disputedRows, closed) {
@@ -1185,11 +1247,6 @@ function secondStrongCorrectiveText(places) {
     ` הערכים שנקראו אינם נמסרים לך בכוונה: קרא את הצילום באופן עצמאי, מההתחלה ועד הסוף, כאילו לא נקרא מעולם — הקריאות הקודמות עשויות לטעות. המקומות שלמעלה הם רק המקומות שבהם כדאי להאט ולבדוק פעמיים.` +
     ` כמות, מחיר יחידה וסכום שורה נקראים כל אחד מהעמודה שלו בדיוק כפי שהוא מודפס — אל תחשב אחד מהאחרים כדי שיסתדרו.` +
     CONSENSUS_KNOWN_FAILURE_TEXT;
-}
-// (a) קריאת ההצלה של סכום הביקורת חולקת את המשבצת: ההנחיה שלה נשארת כפי שהייתה,
-// ובסופה רק המקומות של השדות הפתוחים — בלי ערכים.
-function secondStrongChecksumAddendum(places) {
-  return ` בנוסף, קריאות קודמות של אותו צילום לא אישרו זו את זו בשדות האלה (הערכים אינם נמסרים לך בכוונה — קרא אותם מהצילום בעצמך): ${secondStrongPlacesText(places)}`;
 }
 
 
@@ -2276,7 +2333,7 @@ function decodeAnalyzeClaims(result, aliasToId) {
       // v19 (C4): אותה רשומה ב-consensus.secondStrongRead וביומן invoice_scan_audit. כשהמתג
       // כבוי היא אינה קיימת כלל, והתשובה והיומן הם של שירות 18.
       const secondStrongRead = secondStrongReadOn
-        ? { outcome: "not_needed", stage: null, model: null, requestId: null, asked: 0, usage: null, closed: [], open: [], notAsked: [] } : null;
+        ? { outcome: "not_needed", stage: null, model: null, requestId: null, asked: 0, usage: null, closed: [], open: [], notAsked: [], differences: [] } : null;
       if (secondStrongRead) {
         scanAudit.secondStrongRead = secondStrongRead;
         // ב-Cloud Run היומן הוא console (start() אינו מעביר logger), ו-console.info מציג אובייקט
@@ -2563,27 +2620,19 @@ function decodeAnalyzeClaims(result, aliasToId) {
         secondStrongRead.notAsked = plan.notAsked.slice(0, MAX_CONSENSUS_DIFFS);
         if (!openFields.length && plan.notAsked.some(item => item.reason === "not_matchable")) secondStrongRead.outcome = "not_matchable";
       }
-      let secondStrongWitness = null; // {stage, scan} — מצביעה בלבד, לעולם אינה נבחרת
+      let secondStrongExtra = null; // {stage, scan} — Terra#2, לעולם אינה נבחרת; null — לא נקראה או נכשלה
       let secondStrongAsked = [];
-      const recordSecondStrong = (stage, asked, result, attemptAudit) => {
-        secondStrongAsked = asked;
-        Object.assign(secondStrongRead, { stage, model: attemptAudit ? attemptAudit.requestedModel : openaiRetryModel, asked: asked.length,
-          requestId: attemptAudit ? attemptAudit.requestId || null : null, usage: attemptAudit ? attemptAudit.usage || null : null });
-        if (result.fail) {
-          secondStrongRead.outcome = "failed";
-          secondStrongRead.error = result.fail.body && result.fail.body.error || "second_strong_read_failed";
-        }
-      };
       if (firstMismatches.some(item => item.retryable !== false)) {
         checksumRetryAttempted = true;
-        // v19 (a): המשבצת משותפת. קריאת ההצלה יוצאת כמו תמיד, ובהנחיה שלה גם המקומות של
-        // השדות הפתוחים — בלי ערכים. מסמך שההנחיה נושאת את הסכומים שלו אינו נשאל.
-        const noteDocs = new Set(firstMismatches.map(item => Number(item.noteIndex)));
-        const asked = openFields.filter(item => !noteDocs.has(Number(item.noteIndex)));
-        const attemptsBefore = scanAudit.attempts.length;
-        const second = await attemptScan(checksumCorrectiveText(firstMismatches) + (asked.length ? secondStrongChecksumAddendum(asked) : ""),
-          CHECKSUM_RETRY_REASONING_EFFORT, true); // v7: הסלמה
-        let retryWon = false;
+        // v19 (a), הכרעת הבעלים הסופית: הנייר של הקריאה שנבחרה נכשל, ולכן המשבצת היא של קריאת
+        // ההצלה בדיוק כמו בשירות 18 — אותה הנחיה, ושום שדה אינו נסגר ממנה. שדה שעמד בתנאים ולא
+        // נשאל בגלל זה נרשם (C4) עם הסיבה checksum_retry_slot. (רק בסריקה של כמה תעודות: שדה שנשאל
+        // דורש נייר שנסגר, ולכן הוא תמיד בתעודה אחרת מזו שנכשלה.)
+        if (secondStrongRead && openFields.length) {
+          secondStrongRead.outcome = "checksum_retry_slot";
+          secondStrongRead.notAsked = plan.notAsked.concat(openFields.map(item => ({ ...item, reason: "checksum_retry_slot" }))).slice(0, MAX_CONSENSUS_DIFFS);
+        }
+        const second = await attemptScan(checksumCorrectiveText(firstMismatches), CHECKSUM_RETRY_REASONING_EFFORT, true); // v7: הסלמה
         if (!second.fail) {
           const secondMismatches = scanChecksumMismatches(second.scan, documents);
           second.audit.validation = photoFirst ? paperChecks(second.scan) : secondMismatches;
@@ -2592,15 +2641,6 @@ function decodeAnalyzeClaims(result, aliasToId) {
           if (!lostSummary && (!secondMismatches.length || checksumTotalError(secondMismatches) < checksumTotalError(firstMismatches))) {
             attempt.audit.selected = false; second.audit.selected = true;
             ({ scan, data, openaiResponse } = second);
-            retryWon = true;
-          }
-        }
-        if (asked.length) {
-          recordSecondStrong("checksum_retry", asked, second, scanAudit.attempts[attemptsBefore]);
-          // קריאת הצלה שניצחה היא הקריאה שנבחרה, ולכן אינה מצביעה על עצמה; שהפסידה — עדה.
-          if (!second.fail) {
-            secondStrongRead.outcome = retryWon ? "selected" : "read";
-            if (!retryWon) secondStrongWitness = { stage: "checksum_retry", scan: second.scan };
           }
         }
         for (const item of scanChecksumMismatches(scan, documents)) {
@@ -2619,10 +2659,15 @@ function decodeAnalyzeClaims(result, aliasToId) {
         // שתי זולות, כמו בשירות 18 — וההמתנה הגרועה אינה גדלה. כישלון אינו חוזר ואינו משנה דבר.
         const attemptsBefore = scanAudit.attempts.length;
         const extra = await attemptScan(secondStrongCorrectiveText(openFields), CHECKSUM_RETRY_REASONING_EFFORT, true, SECOND_STRONG_RULE);
-        recordSecondStrong(SECOND_STRONG_RULE, openFields, extra, scanAudit.attempts[attemptsBefore]);
-        if (!extra.fail) {
-          secondStrongRead.outcome = "read";
-          secondStrongWitness = { stage: SECOND_STRONG_RULE, scan: extra.scan };
+        const extraAudit = scanAudit.attempts[attemptsBefore];
+        secondStrongAsked = openFields;
+        Object.assign(secondStrongRead, { stage: SECOND_STRONG_RULE, model: extraAudit ? extraAudit.requestedModel : openaiRetryModel, asked: openFields.length,
+          requestId: extraAudit ? extraAudit.requestId || null : null, usage: extraAudit ? extraAudit.usage || null : null });
+        if (extra.fail) {
+          secondStrongRead.outcome = "failed";
+          secondStrongRead.error = extra.fail.body && extra.fail.body.error || "second_strong_read_failed";
+        } else {
+          secondStrongExtra = { stage: SECOND_STRONG_RULE, scan: extra.scan };
         }
       }
 
@@ -2637,16 +2682,17 @@ function decodeAnalyzeClaims(result, aliasToId) {
         const paperOk = new Map(paperChecks(scan).map(check => [Number(check.noteIndex), check.ok === true]));
         const options = { paperConfirmsRows: noteIndex => paperOk.get(Number(noteIndex)) === true };
         consensus.disputedRows = scanConsensusDisputedRows(scan, witnesses, options);
-        // v19: הקריאה החזקה השנייה מצביעה רק על השדות שנשאלה עליהם, מול אותה קריאה נבחרת
-        // (Terra) שהשדות חושבו מולה. היא אינה עדה ל-missingRows, לתאריך או לקוד: שם היא רק
-        // הייתה מוסיפה או מסירה מחלוקות שאינן שלה (C2). קריאת הצלה שניצחה אינה מצביעה.
-        if (secondStrongRead && secondStrongAsked.length && secondStrongRead.outcome !== "selected") {
-          const selectedRead = { stage: attempt.audit.stage, scan };
-          const votes = scanSecondStrongReadVotes(selectedRead,
-            witnessReadsOf(scan).map(read => ({ stage: read.audit.stage, scan: read.scan })), secondStrongWitness, secondStrongAsked);
-          secondStrongRead.closed = votes.closed;
-          secondStrongRead.open = votes.open;
-          consensus.disputedRows = withoutSecondStrongClosures(consensus.disputedRows, votes.closed);
+        // v19, הכרעת הבעלים הסופית: הקריאה של Terra#2 כולה מול הקריאה של Terra כולה — אותה קריאה
+        // נבחרת שהשדות חושבו מולה (במקרה (b) היא אינה מתחלפת). זהה — השדות שנשאלו ועומדים ב-C1 וב-C2
+        // נסגרים; הבדל אחד בכל מקום — שום דבר אינו נסגר. היא אינה עדה ל-missingRows, לתאריך או לקוד:
+        // שם היא רק הייתה מוסיפה או מסירה מחלוקות שאינן שלה (C2).
+        if (secondStrongRead && secondStrongAsked.length) {
+          const result = scanSecondStrongReadClosures({ stage: attempt.audit.stage, scan }, secondStrongExtra, secondStrongAsked, documents);
+          secondStrongRead.closed = result.closed;
+          secondStrongRead.open = result.open;
+          secondStrongRead.differences = result.differences;
+          if (secondStrongExtra) secondStrongRead.outcome = result.differences.length ? "not_identical" : "identical";
+          consensus.disputedRows = withoutSecondStrongClosures(consensus.disputedRows, result.closed);
         }
         consensus.missingRows = scanConsensusMissingRows(scan, witnesses, options);
         for (const item of consensus.disputedRows) {

@@ -11,25 +11,70 @@ This is the owner's approved design, live with no trial period:
    photo. A field where Terra agrees with one cheap read is accepted. This is
    the existing 2-of-3 rule, unchanged.
 3. On a field where Terra agrees with neither cheap read, a second strong read
-   (Terra#2) reads the photo. If Terra#2 reads that field exactly as Terra did,
-   the field is accepted and the worker does nothing.
+   (Terra#2) reads the whole note again. If Terra#2's whole read is identical
+   to Terra's whole read, the field is accepted and the worker does nothing.
 4. Otherwise the field goes to the worker as today, in
    `consensus.disputedRows`, with the selected read's value.
 
 "Accepted" applies to one field of one row, never to a whole document.
-Terra#2 only votes for a value. The selected read supplies every value, and
-Terra#2 is never the selected read. Terra#2 never adds a dispute: what it reads
-elsewhere is not compared, and it is not a witness for `missingRows`, for
-`docDateUnconfirmed` or for a code.
+Terra#2 never supplies a value. The selected read supplies every value, and
+Terra#2 is never the selected read. Terra#2 never adds a dispute: it is not a
+witness for `missingRows`, for `docDateUnconfirmed` or for a code.
 
-**Every read counts only for the printed line it read.** Step 3 compares what
-each read saw in the asked printed line: the cheap reads (to decide whether to
-ask) and Terra#2 (to decide whether it confirms). That reading is never taken
-from the consensus alignment that `diffs` and `disputedRows` use. The alignment
-pairs rows by position when both reads have the same number of rows, and by
-content otherwise. It pairs different printed lines when a read lists rows in
-another order, skips one line and doubles another, or shifts one column against
-the others, which is this paper's known failure.
+### How Terra#2 decides: the whole read
+
+This is the owner's final rule. It replaced a per-row vote, in which Terra#2's
+reading of the asked printed line was matched by page, line, code and table
+and then compared field by field. That vote is gone.
+
+Terra#2's whole read is compared with Terra's whole read
+(`scanSecondStrongWholeReadDifferences`):
+
+- the same documents (one per `noteIndex`, in both reads);
+- in each document, the same document type (a credit note or not), the same
+  page count, and the same summary fields that the consensus compares:
+  `vatPct`, `itemsSectionTotalExVat`, `promoDiscountExVat`,
+  `itemsPrintedLines`, `returnsSectionTotalExVat`, `returnsPrintedLines`,
+  `subtotalExVat`, `vatAmount`, `totalInclVat` and `roundingDiff`. The
+  document date is left out. It is not a summary field, and the owner ruled
+  in service 18 that it decides nothing;
+- the same number of rows, in the same order;
+- on every row, the same identity and the same quantity and money. Identity
+  is the code plus the kind of row: items or returns (`section`), and
+  deposit or not (`פיקדון` in the description, the test the service uses
+  everywhere). Quantity and money are `quantity`, `unitPriceExVat` and
+  `lineTotalExVat`. Tnuva rows have no other money fields.
+
+Values are normalised as the consensus normalises them (`consensusValue`):
+quantity to a thousandth, money to the agora, the code trimmed, and the
+document type as credit against everything else. Nothing else is measured.
+That covers descriptions (beyond the deposit test), confidence, warnings, the
+promotion star, the page, and each read's own `lineNumber`. Tnuva paper prints
+no line numbers, so the order of the rows is what is compared.
+
+If, and only if, the two reads are identical, every asked field that also
+passes C1 and C2 in the selected read is closed, with `closedBy:
+"second_strong_read"`. If there is any difference anywhere, nothing closes.
+That includes another row, another note of the scan, the order of the rows,
+the row count, and a summary field. The asked fields go to the worker as
+today, with `outcome: "not_identical"`, and the first differences are logged
+(below). In particular, Terra#2 can read the asked field exactly like Terra
+and still close nothing, because it read something else differently.
+
+### When Terra#2 is asked (unchanged)
+
+Only the decision changed. When Terra#2 is asked is the same as before, and
+every ask-side safeguard is kept. They all err toward the worker.
+
+**Every cheap read counts only for the printed line it read.** Step 3 asks
+whether the cheap reads split on the asked printed line. That is decided from
+what each cheap read saw in the asked printed line, never from the consensus
+alignment that `diffs` and `disputedRows` use. The alignment pairs rows by
+position when both reads have the same number of rows, and by content
+otherwise. It pairs different printed lines when a read lists rows in another
+order, skips one line and doubles another, or shifts one column against the
+others, which is this paper's known failure. This matching decides only
+whether to ask. It plays no part in how Terra#2 decides.
 
 Tnuva paper prints no line numbers. `lineNumber` is each read's own count of
 the rows, so a row's page, line and code name a printed line only if the read
@@ -39,7 +84,7 @@ follow the codes. Its row at the asked line carries the right code and the
 numbers of the neighbouring line, and nothing in that row shows it. Only the
 read's whole table shows it. Tnuva paper has also printed no note number since
 service 17, and a read names each of its documents by its own `noteIndex`
-label. A read's reading of the asked line therefore counts only when the
+label. A cheap read's reading of the asked line therefore counts only when the
 paper, the row and the table all match.
 
 The paper, when the scan holds more than one note (one note needs no check,
@@ -96,14 +141,14 @@ The table, line by line against the selected read's table:
   paper that really prints the same numbers on two neighbouring lines, which
   the selected read read differently, leaves its fields with the worker.
 
-Anything else is "not matched", and the read counts for neither side. The table
-is judged as a whole, so a read that missed a row, read another unit price,
-moved a code or read a line's numbers twice anywhere in the document counts for
-none of its lines, and those fields stay with the worker. The code only
-identifies the printed line here. It is not decided or reported, and no read
-becomes a witness for a code. This applies to step 3 only. `diffs`,
-`disputedRows`, `missingRows`, the 2-of-3 rule and everything else in service
-18 are unchanged, and with the switch off nothing of this runs.
+Anything else is "not matched", and the cheap read counts for neither side.
+The table is judged as a whole, so a cheap read that missed a row, read
+another unit price, moved a code or read a line's numbers twice anywhere in
+the document counts for none of its lines. The code only identifies the
+printed line here. It is not decided or reported, and no read becomes a
+witness for a code. This applies to step 3 only. `diffs`, `disputedRows`,
+`missingRows`, the 2-of-3 rule and everything else in service 18 are
+unchanged, and with the switch off nothing of this runs.
 
 If the selected row has no `lineNumber`, no code, or a code (or a page and
 line) that it shares with another row, no reading can be matched. The same
@@ -116,38 +161,20 @@ another read can be told to be that paper. In these cases no field of that row
 is asked about and no extra read is bought for it. When that is the only reason
 nothing is asked, `outcome` is `not_matchable` instead of `not_needed`.
 
-**What the rules cannot see.** Suppose a value column slid only across rows
-that all have the same unit price (or, when the unit price is the asked field,
-after Terra itself took the neighbouring line's price), and the gap it left was
-filled without an empty row, a moved code, a different row count or a line's
-numbers read twice. For example, an extra or invented row of numbers at the
-same price filled it, under a code that appears nowhere else. Or the repeated
-numbers are exactly what the selected read has on both lines. Then the read
-still counts at the asked line, with its neighbour's numbers. A cheap read like
-that can still qualify a field that only the other cheap read really read, and
-a Terra#2 like that can still confirm Terra's swap of two same-price twins.
-Likewise, a read that swapped the labels of two notes still counts if it also
-misread one note's subtotal as exactly the other's printed subtotal. This is
-the remaining risk of step 3 on this paper, next to the one the owner accepted:
-two strong reads that make the same mistake on a field that the cheap reads
-really split on.
-
-The review (round five) reproduced the repeated-numbers form with a single pair
-of same-price twins, on both sides: a cheap read with one twin's numbers on
-both twin lines qualified a field that only the other cheap read had read, and
-a Terra#2 doing the same confirmed Terra's swap of the twins. The review left
-the choice between two fixes to the owner, and both were measured on its
-generator: counting Terra#2 only when its own paper closes (it covers the
-Terra#2 form only, and cost about 13% of the correct closures), or the
-repeated-numbers rule above (it covers both forms, and cost about 8%). Service
-19 takes the repeated-numbers rule, in the stricter form above, and not the
-paper rule for Terra#2, which would block none of the ten closures that remain.
-Measured with the review's fuzzer on the same 36,000 scenarios, the correct
-closures go from 1,073 to 958 (about 11% fewer). On the round-five generator,
-where a quarter of the cheap reads slide, they go from 663 to 323, while the
-closures counted from another note or another line's numbers go from 858 to 10,
-all ten of them the case above where the selected read has the repeated numbers
-on both lines. This choice is the owner's to confirm.
+**What the ask-side rules cannot see.** Suppose a cheap read's value column
+slid only across rows that all have the same unit price (or, when the unit
+price is the asked field, after Terra itself took the neighbouring line's
+price), and the gap it left was filled without an empty row, a moved code, a
+different row count or a line's numbers read twice. For example, an extra or
+invented row of numbers at the same price filled it, under a code that appears
+nowhere else. Or the repeated numbers are exactly what the selected read has
+on both lines. Then that cheap read still counts at the asked line, with its
+neighbour's numbers, and it can qualify a field that only the other cheap read
+really read. Likewise, a cheap read that swapped the labels of two notes still
+counts if it also misread one note's subtotal as exactly the other's printed
+subtotal. The field is then asked, and it closes only if Terra#2 reads the
+whole note exactly as Terra did. That leaves one remaining risk, which the
+owner accepted: two strong reads that make the same mistake.
 
 **Step 3 needs cheap reads that disagree on that field.** A field is asked
 about only when every cheap read that completed read the asked printed line by
@@ -167,8 +194,8 @@ and each row's arithmetic still closes, so C1 cannot catch it. The same holds
 when only one cheap read has a reading of the line. The other one failed, did
 not read that field, or is not matched to that line, by its row or by its
 table. It may have read exactly what the other one read, so two strong reads do
-not outvote the one that did. The exception is the slide that the rules cannot
-see (above). In all these cases the field goes to the worker, as in service 18.
+not outvote the one that did. In all these cases the field goes to the worker,
+as in service 18.
 
 Terra#2 seconds Terra only. When a client sends `strongReadSelection: true`
 and a cheap read is selected because its paper closes better, Terra has
@@ -176,42 +203,32 @@ already disagreed with that read on every open field. Two strong reads that
 disagree confirm nothing, so no extra read is bought. Apart from that, the rule
 does not depend on the flag: it only removes disputes.
 
-**Terra#2 votes only on the printed line it was asked about.** Its vote counts
-only when its reading of the asked line is matched by the same rule: paper, row
-and table. Suppose Terra#2 returns another note under the asked note's label,
-skips the asked line, numbers two rows with that line, or puts another line's
-code there. Or its table does not line up with the selected one: it has a row
-more or less, a moved code, a row without numbers, a neighbour's price, or one
-line's numbers twice, as when its quantities slid one row under a complete code
-column. Then it does not confirm anything. If Terra swapped two same-price
-twins, Terra#2's correct read of the neighbouring line, or of the same line on
-the other note of the order, would otherwise equal Terra's wrong value in the
-asked line. The paper and each row's arithmetic still close, so C1 cannot catch
-it. The exception is the slide that the rules cannot see (above). A Terra#2
-that has no row at that page and line gets `not_seen`. One whose row or table
-there does not match gets `not_matched`. Either way `reads` shows `value: null`
-and `seen: false` for it, and the field goes to the worker.
+### The slot
 
-**The slot.** Terra#2 shares the checksum-retry slot. It runs only when the
-checksum retry does not, so it never adds a model call to what service 18
-could make. In the worst case that is still six calls with the default two
-cheap reads: each cheap read retried once after a quick network drop, the
-escalation, and the slot (eight with `OPENAI_CONSENSUS_READS=3`, also as in
-service 18). The worst-case wait does not grow:
+Terra#2 shares the checksum-retry slot. It runs only when the checksum retry
+does not, so it never adds a model call to what service 18 could make. In the
+worst case that is still six calls with the default two cheap reads: each
+cheap read retried once after a quick network drop, the escalation, and the
+slot (eight with `OPENAI_CONSENSUS_READS=3`, also as in service 18). The
+worst-case wait does not grow.
 
-- (a) If the selected paper fails and can be retried, the checksum retry runs
-  as before. Its note is service 18's note, followed by the locations of the
-  open fields that Terra#2 could settle. A retry that wins becomes the
-  selected read, as before (`outcome: "selected"`), and it votes for nothing.
-  A retry that loses is the extra read, and its votes count. A document whose
-  sums the checksum note quotes is never asked about.
+- (a) If the selected paper fails and can be retried, the slot is service
+  18's checksum retry, byte for byte: the same note, with no locations added,
+  and the same selection. Nothing closes from it, whether it wins or loses.
+  The fields that Terra#2 would have been asked about stay with the worker.
+  They are logged in `notAsked` with `reason: "checksum_retry_slot"`, and
+  `outcome` is `checksum_retry_slot`. An asked field needs a selected paper
+  that closes, so this happens only in a scan of several notes, when another
+  note fails.
 - (b) Otherwise, if an eligible field is open after the escalation, one call
-  runs with stage `second_strong_read`.
+  runs with stage `second_strong_read`. Only this call can close fields.
 
 A Terra#2 call that fails or times out changes nothing and is never retried.
 
-**The five conditions.** A field closes through Terra#2 only when all five
-hold:
+### The five conditions
+
+A field closes through Terra#2 only when Terra#2's whole read is identical to
+Terra's and all five conditions hold:
 
 - **C1, paper proof.** The selected document must pass `tnuvaPaperCheck`
   against its own printed `סהכ חייב מעמ` and `פריטים` counter. The row's own
@@ -224,60 +241,69 @@ hold:
   promotion star, the section, the page, a row's existence, the row count, a
   summary field, the returns section, a deposit row (`פיקדון`), a credit note,
   a credit marked only by a minus, and a mixed paper. In practice the selected
-  document must be `receivable`. This is judged on every read, not only on the
-  selected one. If any cheap read saw a credit note, a minus summary or returns
+  document must be `receivable`. On the ask side this is also judged on the
+  cheap reads. If any cheap read saw a credit note, a minus summary or returns
   in that document (`review` of `tnuvaPaperCheck`), the document's fields are
   not asked about. They are not asked about either if any cheap read read the
-  asked line as a deposit or a returns row. The same holds for Terra#2's own
-  read: if it saw a credit note, a minus summary or returns in that document,
-  or read the asked line as a deposit or a returns row, its vote does not count
-  (`not_eligible`). A code dispute stays exactly as in service
-  18, `confirmed` count included. That count drives the "manual approval"
-  warning and the app's catalog route, so raising it would settle an identity.
-  A row whose identity is still open is not asked about at all. Such a row has
-  a code dispute in which no witness confirms the selected code (`confirmed:
-  0`). Its quantity and money stay with the worker, together with its code. If
-  they closed, the card would hold only the code, and the app's same-price
-  identity rule would settle it on its own. Terra#2 would then decide an
-  identity indirectly, even when its own read of that row named the other code.
+  asked line as a deposit or a returns row. Terra#2 cannot see a credit note,
+  a minus, returns or a deposit that Terra did not see, because any of those
+  is a difference in the whole read. A code dispute stays exactly as in
+  service 18, `confirmed` count included. That count drives the "manual
+  approval" warning and the app's catalog route, so raising it would settle an
+  identity. A row whose identity is still open is not asked about at all. Such
+  a row has a code dispute in which no witness confirms the selected code
+  (`confirmed: 0`). Its quantity and money stay with the worker, together with
+  its code. If they closed, the card would hold only the code, and the app's
+  same-price identity rule would settle it on its own. Terra#2 would then
+  decide an identity indirectly.
 - **C3, independence.** The note carries only locations (document, page,
   printed line, field name) and the known-failure warnings. It carries no
   value from any earlier read. The read uses the same photos and system prompt
   as the cheap reads, on `OPENAI_RETRY_MODEL` at high effort.
 - **C4, logging.** `consensus.secondStrongRead` holds `{outcome, stage, model,
-  requestId, asked, usage, closed, open, notAsked}`, plus `error` when the call
-  failed. The same object goes to `scanAudit.secondStrongRead` and to the
-  `invoice_scan_audit` log line. On Cloud Run the logger is `console`, and
-  `console.info` prints an object only to depth 2, so `closed` and `open` would
-  print as `[Object]`. In the log line the record is therefore printed as one
-  line of complete JSON that also carries `scanAuditId`, so the line stands on
-  its own: `secondStrongRead:
-  {"scanAuditId":"…","outcome":"read",…,"closed":[…]}`. The response is
+  requestId, asked, usage, closed, open, notAsked, differences}`, plus `error`
+  when the call failed. The same object goes to `scanAudit.secondStrongRead`
+  and to the `invoice_scan_audit` log line. On Cloud Run the logger is
+  `console`, and `console.info` prints an object only to depth 2, so `closed`
+  and `open` would print as `[Object]`. In the log line the record is
+  therefore printed as one line of complete JSON that also carries
+  `scanAuditId`, so the line stands on its own: `secondStrongRead:
+  {"scanAuditId":"…","outcome":"identical",…,"closed":[…]}`. The response is
   unchanged, and with the switch off the record and the line are absent, as in
   service 18. Each entry in `closed` names `noteIndex`, `rowIndex`, `page`,
-  `lineNumber`, `field` and the selected `value`, and it carries `rule:
-  "second_strong_read"`. It also lists what every read saw in the asked printed
-  line under `reads`: `{stage, value}`, or `{stage, value: null, seen: false}`
-  for a read that has no row at that page and line, with `unmatched` when it is
-  not matched: by the paper (`other_subtotal` or `subtotal_repeated`, only in a
+  `lineNumber`, `field` and the selected `value`, and it carries `closedBy:
+  "second_strong_read"`. Under `reads` it lists each read's value: the
+  selected read, what every cheap read saw in the asked printed line, and
+  Terra#2's value at the same place in its identical table. A cheap read is
+  shown as `{stage, value}`, or as `{stage, value: null, seen: false}` when it
+  has no row at that page and line. It also carries `unmatched` when it is not
+  matched: by the paper (`other_subtotal` or `subtotal_repeated`, only in a
   scan of several notes), by the row (`other_code`, `line_repeated` or
   `code_repeated`) or by the table (`lines_differ`, `code_moved`,
-  `numbers_missing`, `price_differs` or `numbers_repeated`). A read whose paper
-  and row matched the line but that saw a credit note, a minus or returns, or
-  read the line as a deposit or a returns row, carries its value and
-  `ineligible` (`credit_or_returns`, `deposit_row` or `returns_row`); this is
-  judged before the table. `open` lists the fields that were asked about and
-  left for the worker, with `reason` set to `disagrees`, `not_seen`,
-  `not_matched`, `not_eligible` or `failed`. `notAsked` lists each field that
-  met service 18's "no witness confirms it" and the C1 and C2 conditions but
-  was not asked about, in the same shape, with `reason` set to `not_matchable`
-  (plus `unmatched`: `no_subtotal`, `subtotal_repeated`, `no_line_number`,
+  `numbers_missing`, `price_differs` or `numbers_repeated`). A cheap read
+  whose paper and row matched the line, but that saw a credit note, a minus or
+  returns, or read the line as a deposit or a returns row, carries its value
+  and `ineligible` (`credit_or_returns`, `deposit_row` or `returns_row`); this
+  is judged before the table. `open` lists the fields that were asked about
+  and left for the worker, in the same shape without Terra#2. Its `reason` is
+  `not_identical` or `failed`, or `not_eligible`, which a selected read that
+  passed the ask side cannot reach. `differences` lists the first ten
+  differences between Terra's and Terra#2's whole reads, in comparison order,
+  each with `values: [Terra, Terra#2]`. A document difference has `{noteIndex,
+  scope: "document", field}`. Here `field` is a document field, or `rowCount`,
+  or `document` (how many documents each read has under that `noteIndex`). A
+  row difference has `{noteIndex, scope: "row", rowIndex, lineNumber, field}`,
+  where `field` is `section`, `deposit`, `code`, `quantity`,
+  `unitPriceExVat` or `lineTotalExVat`. `notAsked` lists each field that met
+  service 18's "no witness confirms it" and the C1 and C2 conditions but was
+  not asked about, in the same shape. Its `reason` is `not_matchable` (plus
+  `unmatched`: `no_subtotal`, `subtotal_repeated`, `no_line_number`,
   `no_page`, `no_code`, `code_repeated`, `line_repeated` or `table_unclear`),
-  `lone`, `cheap_agree`, `cheap_confirms` or `cheap_not_item_row`. Like
-  `diffs`, it keeps at most 200 entries. The app ignores it; it is there for
-  the log. The extra call is an ordinary attempt in `scanAudit.attempts`, with
-  its usage, and its usage is also in the record's `usage`, which the log line
-  prints in full.
+  `lone`, `cheap_agree`, `cheap_confirms`, `cheap_not_item_row` or
+  `checksum_retry_slot`. Like `diffs`, it keeps at most 200 entries. The app
+  ignores it; it is there for the log. The extra call is an ordinary attempt
+  in `scanAudit.attempts`, with its usage, and its usage is also in the
+  record's `usage`, which the log line prints in full.
 - **C5, kill switch.** `SECOND_STRONG_READ=off` (also `false` or `0`) restores
   service 18. With it, the service sends byte-identical model requests and
   returns the same answer, and `secondStrongRead` is absent from the response
@@ -285,10 +311,18 @@ hold:
   which is true only when the switch is on and a retry model is configured,
   since without a retry model there is no strong read.
 
-Possible values of `outcome`: `not_needed` (no extra read was asked anything),
-`not_matchable` (nothing was asked only because the selected row cannot be
-matched to one printed line of one paper), `read`, `selected` (case (a) only)
-and `failed`.
+Possible values of `outcome`:
+
+- `not_needed`: no extra read was asked anything.
+- `not_matchable`: nothing was asked only because the selected row cannot be
+  matched to one printed line of one paper.
+- `checksum_retry_slot`: fields would have been asked, but the selected paper
+  failed and the slot went to the checksum retry (case (a)).
+- `identical`: Terra#2's whole read is identical to Terra's, and the asked
+  fields closed.
+- `not_identical`: Terra#2's whole read differs from Terra's somewhere, so
+  nothing closed.
+- `failed`: the Terra#2 call failed.
 
 ## Service 18
 
