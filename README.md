@@ -1,4 +1,85 @@
-# Tnuva invoice scanner — service 19
+# Tnuva invoice scanner — service 20
+
+## Service 20
+
+Service 20 is about a disputed code. On 29.10 the two cheap reads split on the
+code of line 27 (4172329 against 4127329, the same digits with 7 and 2
+swapped), the paper selected the first cheap read, and Terra most probably read
+the code like the second one. Two reads out of three were right, the selected
+read supplied the value, and the worker got a "confirm the identity" card that
+did not say what each read saw. The owner's rule (29.10): a code dispute is
+settled at the client, without a question, when reads agree, and one more
+strong read is bought for a code only when nothing agrees yet. Nothing settles
+on the price alone.
+
+What the service adds:
+
+1. **`reads` and `agreement` on every disputed code.** Each `code` entry of
+   `consensus.disputedRows[].fields` carries `reads`: what every completed read
+   saw on that printed line, the selected read first (`{stage, value,
+   selected: true}`), then each witness in stage order as `{stage, value}`, or
+   `{stage, value: null, seen: false}` when the read has no such line, plus
+   `unmatched` with the reason when it could not be matched (below). It also
+   carries `agreement`: `{code, kind, stages}` or `null`. `kind` is
+   `strong_strong` when every strong read (at least two) read the same code,
+   `strong_cheap` when a strong read and a cheap read did, and `cheap_cheap`
+   when two cheap reads did (step 1 of service 19: Terra disagreeing with both
+   does not make Terra right). Two strong-cheap pairs on two different codes
+   are no agreement. `stages` lists every read that read the agreed code, the
+   selected read included. A strong read is a read on `OPENAI_RETRY_MODEL`:
+   `consensus_escalation`, `checksum_retry` and `second_strong_read`; without
+   a retry model there is no strong read. `selected`, `other` and `confirmed`
+   are unchanged. The catalog and the printed price decide at the client (app
+   147): the agreed code must identify one product whose catalog price equals
+   the printed price to the agora; a same-price rival among the other codes
+   read still asks, unless both strong reads agree (app rule 109's guards).
+   This reporting needs no extra call and does not depend on the switch.
+2. **The printed line is named by its money, not by its code.** The code is
+   the thing in dispute, so a witness's row is the selected row's printed line
+   only by its quantity, unit price and line total (`consensusValue`
+   normalisation): with the same row count, the row at the same position with
+   the same numbers (as the consensus aligns; a shifted code column then shows
+   a different code on every line, never an agreement); with another row
+   count, the one row with those numbers, and only when those numbers appear
+   on one row of that document in both reads (seven Yoplait lines at 12 ×
+   3.69 name no line). A returns or deposit row against an item row (or the
+   reverse) is not the same line. In a scan of several notes the paper is
+   found as in service 19 (`secondStrongPaperOf`). Reasons in `unmatched`:
+   `no_numbers` (the selected row lacks a quantity, unit price or total),
+   `numbers_differ`, `numbers_repeated`, `other_kind`, `other_subtotal`,
+   `subtotal_repeated`.
+3. **One more strong read for a code, only when asked and only when nothing
+   agrees.** A client that sends `codeAgreement: true` (app 147; an older app
+   cannot use the answer, so no read is bought for it) gets a
+   `second_strong_read` call for a disputed code when the switch is on, a
+   strong read completed, the selected row has numbers, and the three reads
+   hold no agreement (Terra read neither cheap read's code, or did not read the
+   line). It shares service 19's slot: at most one extra call per scan, asked
+   about every place at once (service 19's money fields and the codes), and
+   never when the checksum retry runs — then the code goes to `notAsked` with
+   `checksum_retry_slot`. The note carries only places (C3) and one more
+   sentence: read the code digit by digit from the code column, never complete
+   it from a known product. Terra#2 is never selected and supplies no value; it
+   is a witness for the code through `reads` only. For money fields, missing
+   rows and the date it stays exactly as in service 19.
+4. **The record.** `consensus.secondStrongRead.codes` lists every code place
+   that was asked: `{noteIndex, rowIndex, page, lineNumber, field: "code",
+   value, reads, agreement}` with Terra#2's reading included. `asked` counts
+   them. `notAsked` carries code places with `agreed` (plus the `agreement`),
+   `no_strong_read`, `not_matchable` or `checksum_retry_slot`. When only codes
+   were asked, `outcome` is `code_agreed`, `code_not_agreed` or `failed`; when
+   money fields were asked too, `outcome` is service 19's (`identical` or
+   `not_identical`) and the codes have their own result. `differences` keeps
+   the first differences between the two strong whole reads, for the log.
+   `consensus.codeAgreement` echoes the flag. `/health` reports
+   `serviceVersion: 20` and `codeAgreement: true`.
+
+Service 20 can be deployed before or after app 147. Against an older app it
+only adds fields that the app ignores and buys nothing new. App 147 against
+service 19 sees no `reads` and behaves as app 146. `SECOND_STRONG_READ=off`
+still buys no fourth read of any kind; `reads` and `agreement` are reported
+either way. `/health` was to show `serviceVersion:20` and
+`codeAgreement:true` after the merge (see "Tests and release").
 
 ## Service 19
 
@@ -585,7 +666,8 @@ to `main` and reports on the merge commit as a GitHub check. The trigger lives
 in GCP and is not visible in this repository, so do not add a second deploy
 pipeline. A green merge alone does not prove the new revision is serving; open
 `/health` and check `serviceVersion`. Service 19 was confirmed this way on
-16.10 (`serviceVersion:19`, `secondStrongRead:true`). The trigger does not run
+16.10 (`serviceVersion:19`, `secondStrongRead:true`); service 20 must report
+`serviceVersion:20` and `codeAgreement:true`. The trigger does not run
 the tests, so run `npm test` before merging.
 
 Service 19 can be deployed before or after any app. It adds the
