@@ -2970,7 +2970,7 @@ test('a full send never collects a stored result: photos mean read, resume means
 // המודפסת (לפי הכסף שלה) ואת ההסכמה; קריאה חזקה שנייה נקנית לקוד רק ללקוח שביקש (codeAgreement:true),
 // ורק כש-Terra לא קראה כמו אף קריאה זולה. הנייר של 29.10: הזולות נחלקו על הקוד של שורה 27 (4172329 מול
 // 4127329), הזולה הראשונה נבחרה על הכסף, ו-Terra קראה כמו השנייה.
-const APP_147 = { strongReadSelection: true, codeAgreement: true };
+const APP_150 = { strongReadSelection: true, codeAgreement: true };
 const terraThird = doc({ ...shiftedCodes, rows: [shiftedCodes.rows[0], row({ ...shiftedCodes.rows[1], code: '333' })] });
 const codeField = output => output.consensus.disputedRows[0].fields.find(item => item.field === 'code');
 const readsOf = output => codeField(output).reads.map(read => [read.stage, read.value, read.selected === true]);
@@ -2978,7 +2978,7 @@ const readsOf = output => codeField(output).reads.map(read => [read.stage, read.
 test('v20: a strong read that read the code like one cheap read is an agreement — reported, and no fourth read is bought', async () => {
   // 29.10: הזולה הראשונה נבחרה (הנייר שלה נסגר), Terra קראה את הקוד כמו הזולה השנייה אבל את הסיכום בטעות.
   const terraLikeSecond = doc({ ...shiftedCodesOther, subtotalExVat: 79 });
-  for (const extraBody of [APP_147, APP_142]) {
+  for (const extraBody of [APP_150, APP_142]) {
     const label = JSON.stringify(extraBody);
     const { output, calls } = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(terraLikeSecond)], input, {}, extraBody);
     assert.equal(calls.length, 3, label + ': Terra agreed with a cheap read, nothing to buy');
@@ -3002,7 +3002,7 @@ test('v20: a strong read that read the code like one cheap read is an agreement 
   assert.deepEqual(readsOf(old.output), [['consensus_escalation', '111', true], ['consensus_1', '222', false], ['consensus_2', '111', false]]);
   assert.deepEqual(codeField(old.output).agreement, { code: '111', kind: 'strong_cheap', stages: ['consensus_escalation', 'consensus_2'] });
   // המתג כבוי: אין קריאה רביעית לשום דבר, אבל הדיווח נשאר — הוא מתוך הקריאות שכבר נעשו.
-  const off = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(terraLikeSecond)], input, SECOND_OFF, APP_147);
+  const off = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(terraLikeSecond)], input, SECOND_OFF, APP_150);
   assert.equal(off.calls.length, 3);
   assert.ok(!('secondStrongRead' in off.output.consensus));
   assert.deepEqual(codeField(off.output).agreement, { code: '111', kind: 'strong_cheap', stages: ['consensus_2', 'consensus_escalation'] });
@@ -3017,7 +3017,7 @@ test('v20: when Terra read a third code, a client that asked gets one more stron
     ['a fourth value', fourth('444'), null, 'code_not_agreed'],
     ['no code at all', fourth(null), null, 'code_not_agreed']];
   for (const [label, extra, agreement, outcome] of cases) {
-    const { output, calls, logs } = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(terraThird), answer(extra)], input, {}, APP_147);
+    const { output, calls, logs } = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(terraThird), answer(extra)], input, {}, APP_150);
     assert.equal(calls.length, 4, label);
     assert.deepEqual(output.scanAudit.attempts.map(a => [a.stage, a.selected]),
       [['consensus_1', false], ['consensus_2', false], ['consensus_escalation', true], ['second_strong_read', false]], label);
@@ -3047,7 +3047,7 @@ test('v20: when Terra read a third code, a client that asked gets one more stron
     assert.ok(output.scan.warnings.some(warning => warning.includes('אישור ידני')), label + ': the warning is the client\'s to lift, with the catalog');
   }
   // הקריאה הרביעית נכשלה: שום דבר לא משתנה, אין ניסיון נוסף, והשדה עם שלוש קריאות בלבד.
-  const failed = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(terraThird), new Error('test network failure')], input, {}, APP_147);
+  const failed = await request([answer(shiftedCodes), answer(shiftedCodesOther), answer(terraThird), new Error('test network failure')], input, {}, APP_150);
   assert.equal(failed.calls.length, 4);
   assert.equal(failed.output.ok, true);
   assert.equal(failed.output.consensus.secondStrongRead.outcome, 'failed');
@@ -3070,7 +3070,7 @@ test('v20: when Terra read a third code, a client that asked gets one more stron
 test('v20: the fourth read shares the slot — a failed paper gives it to the checksum retry, and money fields ride the same call as the code', async () => {
   // (a) כל הקריאות קראו את הסיכום בטעות: Terra נבחרת בשוויון, הנייר נכשל, והמשבצת היא של קריאת ההצלה.
   const wrong = value => doc({ ...value, subtotalExVat: 79 });
-  const slot = await request([answer(wrong(shiftedCodes)), answer(wrong(shiftedCodesOther)), answer(wrong(terraThird)), answer(wrong(terraThird))], input, {}, APP_147);
+  const slot = await request([answer(wrong(shiftedCodes)), answer(wrong(shiftedCodesOther)), answer(wrong(terraThird)), answer(wrong(terraThird))], input, {}, APP_150);
   assert.equal(slot.calls.length, 4);
   assert.deepEqual(slot.output.scanAudit.attempts.map(a => a.stage), ['consensus_1', 'consensus_2', 'consensus_escalation', 'checksum_retry']);
   assert.ok(slot.calls[3].input[1].content.at(-1).text.startsWith('אזהרת סכום ביקורת'));
@@ -3082,7 +3082,7 @@ test('v20: the fourth read shares the slot — a failed paper gives it to the ch
   // (b) שדות הכסף של שירות 19 וקוד בשורה אחרת, באותה קריאה: הכסף נסגר רק בקריאה זהה כולה (כמו ב-19),
   // והקוד — לפי ההסכמה. הזולות נחלקו על הכמות בשורה 2 וקראו בשורה 4 קודים שאינם במאגר של אף אחת.
   const codeAt = (base, code) => doc({ ...base, rows: base.rows.map((item, index) => index === 3 ? { ...item, code } : item) });
-  const both = await request([answer(codeAt(lunaThirteen, '445')), answer(codeAt(lunaSeventeen, '446')), answer(fourRowPaper), answer(fourRowPaper)], input, {}, APP_147);
+  const both = await request([answer(codeAt(lunaThirteen, '445')), answer(codeAt(lunaSeventeen, '446')), answer(fourRowPaper), answer(fourRowPaper)], input, {}, APP_150);
   assert.equal(both.calls.length, 4, 'one extra call for everything');
   const note = both.calls[3].input[1].content.at(-1).text;
   assert.ok(note.includes('שורה 2: quantity, lineTotalExVat.') && note.includes('שורה 4: code.') && note.includes('ספרה אחר ספרה'), note);
@@ -3094,7 +3094,7 @@ test('v20: the fourth read shares the slot — a failed paper gives it to the ch
   assert.deepEqual(both.output.consensus.disputedRows.map(item => [item.lineNumber, bare(item.fields)]), [[4, [{ field: 'code', selected: '444', other: '445', confirmed: 0 }]]]);
   assert.deepEqual(both.output.consensus.disputedRows[0].fields[0].agreement.code, '444');
   // והקריאה הרביעית שקראה את הקוד כמו Terra אבל את הכמות אחרת: הכסף פתוח (לא זהה), הקוד מוסכם.
-  const split = await request([answer(codeAt(lunaThirteen, '445')), answer(codeAt(lunaSeventeen, '446')), answer(fourRowPaper), answer(rowTwo({ quantity: 9, lineTotalExVat: 45 }))], input, {}, APP_147);
+  const split = await request([answer(codeAt(lunaThirteen, '445')), answer(codeAt(lunaSeventeen, '446')), answer(fourRowPaper), answer(rowTwo({ quantity: 9, lineTotalExVat: 45 }))], input, {}, APP_150);
   assert.equal(split.output.consensus.secondStrongRead.outcome, 'not_identical');
   assert.deepEqual(split.output.consensus.secondStrongRead.open.map(item => item.field), ['quantity', 'lineTotalExVat']);
   assert.deepEqual(split.output.consensus.secondStrongRead.codes[0].agreement, { code: '444', kind: 'strong_strong', stages: ['consensus_escalation', 'second_strong_read'] });

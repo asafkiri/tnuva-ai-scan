@@ -30,7 +30,7 @@ What the service adds:
    `consensus_escalation`, `checksum_retry` and `second_strong_read`; without
    a retry model there is no strong read. `selected`, `other` and `confirmed`
    are unchanged. The catalog and the printed price decide at the client (app
-   147): the agreed code must identify one product whose catalog price equals
+   150): the agreed code must identify one product whose catalog price equals
    the printed price to the agora; a same-price rival among the other codes
    read still asks, unless both strong reads agree (app rule 109's guards).
    This reporting needs no extra call and does not depend on the switch.
@@ -49,7 +49,7 @@ What the service adds:
    `numbers_differ`, `numbers_repeated`, `other_kind`, `other_subtotal`,
    `subtotal_repeated`.
 3. **One more strong read for a code, only when asked and only when nothing
-   agrees.** A client that sends `codeAgreement: true` (app 147; an older app
+   agrees.** A client that sends `codeAgreement: true` (app 150; an older app
    cannot use the answer, so no read is bought for it) gets a
    `second_strong_read` call for a disputed code when the switch is on, a
    strong read completed, the selected row has numbers, and the three reads
@@ -74,8 +74,8 @@ What the service adds:
    `consensus.codeAgreement` echoes the flag. `/health` reports
    `serviceVersion: 20` and `codeAgreement: true`.
 
-Service 20 can be deployed before or after app 147. Against an older app it
-only adds fields that the app ignores and buys nothing new. App 147 against
+Service 20 can be deployed before or after app 150. Against an older app it
+only adds fields that the app ignores and buys nothing new. App 150 against
 service 19 sees no `reads` and behaves as app 146. `SECOND_STRONG_READ=off`
 still buys no fourth read of any kind; `reads` and `agreement` are reported
 either way. `/health` was to show `serviceVersion:20` and
